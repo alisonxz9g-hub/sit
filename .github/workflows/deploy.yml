@@ -1,0 +1,92 @@
+name: Deploy to GitHub Pages
+
+# GitHub Pages cannot serve this repository directly: index.html is a Vite entry point
+# that loads src/main.ts, and browsers do not run TypeScript. The site has to be built
+# and the dist/ directory published instead.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it, so Pages is never left
+# half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # postinstall copies the pinned ffmpeg.wasm core into public/vendor, so the site
+      # serves the engine from its own origin instead of a CDN.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          # A project site is served from /<repo>/, a user or org site from /. Vite needs
+          # a trailing slash either way, and appending one blindly would turn "/" into
+          # "//".
+          BASE="${PAGES_BASE:-/}"
+          case "$BASE" in
+            */) ;;
+            *) BASE="$BASE/" ;;
+          esac
+          echo "Building with base path: $BASE"
+          VITE_BASE_PATH="$BASE" npm run build
+
+      # A wrong base path or a stale index.html produces a page that loads and stays
+      # blank, with nothing wrong in the build log. Boot the built bundle in jsdom and
+      # fail here instead, where the reason is visible.
+      - name: Verify the build boots
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          BASE="${PAGES_BASE:-/}"
+          case "$BASE" in
+            */) ;;
+            *) BASE="$BASE/" ;;
+          esac
+          npm run smoke -- "$BASE"
+
+      - name: Check the engine shipped
+        run: |
+          if [ ! -f dist/vendor/ffmpeg/ffmpeg-core.wasm ]; then
+            echo "::error::The ffmpeg core is missing from dist/. Did postinstall run?"
+            exit 1
+          fi
+          du -h dist/vendor/ffmpeg/ffmpeg-core.wasm
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

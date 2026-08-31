@@ -1,0 +1,4 @@
+GitHub Pages runs Jekyll over a site by default, and Jekyll silently skips files and
+directories whose names begin with an underscore or a dot. Vite does not currently emit
+such names, but a future dependency or config change could, and the failure mode is a
+missing asset with no error anywhere. The presence of this file disables Jekyll entirely.

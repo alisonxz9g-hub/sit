@@ -19,5 +19,9 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "vite.config.ts"]
+  // Browser sources only. The Vite config runs under Node and is checked separately by
+  // tsconfig.node.json, so that Node globals like `process` and `Buffer` stay invisible
+  // to application code and a stray use of one is a compile error rather than a
+  // runtime surprise.
+  "include": ["src"]
 }

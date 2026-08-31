@@ -140,13 +140,39 @@ file to confirm it before trusting it.
 ## Deployment
 
 `npm run build` produces a fully static `dist/`, deployable to any static host with no
-special headers. This is why the single-threaded ffmpeg core is used: the multithreaded
-one needs `SharedArrayBuffer`, which requires `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp`. If your host can set those, switching to
-`@ffmpeg/core-mt` in `scripts/sync-ffmpeg.mjs` will make re-encoding several times faster.
+special headers.
 
-Note that `dist/` includes the ~31 MB wasm core. It is fetched lazily on first
-re-encode, not on page load.
+**Serve `dist/`, not the repository.** The `index.html` at the repo root is a Vite entry
+point that loads `src/main.ts`, and browsers do not run TypeScript. Pointing a host at the
+repository root serves that file verbatim and renders a blank page with no error.
+
+**Set the base path if the site is not at a domain root.** Built asset URLs are absolute,
+so a site served from `example.com/subdir/` needs `VITE_BASE_PATH=/subdir/ npm run build`
+or every asset request resolves against the domain root and 404s.
+
+### GitHub Pages
+
+`.github/workflows/deploy.yml` handles both of the above. It builds with the base path
+that `actions/configure-pages` reports, boots the result in jsdom to prove it renders, and
+publishes the artifact.
+
+It needs one manual setting: **Settings → Pages → Source → GitHub Actions**. With Source
+left on "Deploy from a branch", Pages serves the repository source and the workflow output
+is ignored.
+
+`.github/workflows/ci.yml` runs the typecheck, the full test suite (installing ffmpeg for
+the fixtures) and the build on every push and pull request.
+
+### Notes
+
+`dist/` includes the ~31 MB wasm core. It is fetched lazily on the first re-encode, not on
+page load, so the page itself stays well under 100 kB.
+
+The single-threaded ffmpeg core is used so the build deploys anywhere. The multithreaded
+one needs `SharedArrayBuffer`, which requires `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. GitHub Pages cannot set those. On a host that
+can, switching to `@ffmpeg/core-mt` in `scripts/sync-ffmpeg.mjs` makes re-encoding several
+times faster.
 
 ## Licence
 

@@ -20,6 +20,16 @@ export type ProgressHandler = (progress: FfmpegProgress) => void;
 
 const VENDOR_BASE = 'vendor/ffmpeg';
 
+/**
+ * Where the app is mounted. Vite replaces this at build time with the configured
+ * base, which is `/` locally and `/<repo>/` on a GitHub Pages project site. It always
+ * ends in a slash.
+ *
+ * Using this rather than `document.baseURI` keeps the URL independent of the current
+ * route, which matters because the router puts a fragment on every URL.
+ */
+const APP_BASE = import.meta.env.BASE_URL;
+
 let instance: FFmpeg | null = null;
 let loading: Promise<FFmpeg> | null = null;
 
@@ -30,7 +40,7 @@ let currentProgress: ProgressHandler | null = null;
 function vendorUrl(file: string): string {
   const version = import.meta.env.VITE_FFMPEG_VERSION;
   const query = version ? `?v=${encodeURIComponent(version)}` : '';
-  return new URL(`${VENDOR_BASE}/${file}${query}`, document.baseURI).href;
+  return new URL(`${APP_BASE}${VENDOR_BASE}/${file}${query}`, window.location.origin).href;
 }
 
 export class FfmpegError extends Error {
