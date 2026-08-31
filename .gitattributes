@@ -1,0 +1,14 @@
+# Normalise to LF in the repository and on checkout, so the same source does not
+# churn between platforms. Without this, Git for Windows checks these out as CRLF and
+# every clone on another machine shows the whole tree as modified.
+* text=auto eol=lf
+
+# Generated, and only meaningful as a whole.
+package-lock.json -diff linguist-generated
+
+# Never touched by line-ending conversion, in case any land here later.
+*.wasm binary
+*.mp4 binary
+*.mov binary
+*.png binary
+*.woff2 binary
