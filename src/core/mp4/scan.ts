@@ -21,7 +21,7 @@ export interface TopLevelEntry {
 /** A file with more top-level boxes than this is not something we want to walk. */
 const MAX_TOP_LEVEL_BOXES = 4096;
 
-async function readRange(blob: Blob, start: number, end: number): Promise<Uint8Array> {
+async function readRange(blob: Blob, start: number, end: number): Promise<Uint8Array<ArrayBuffer>> {
   const clamped = Math.min(end, blob.size);
   if (start >= clamped) return new Uint8Array(0);
   return new Uint8Array(await blob.slice(start, clamped).arrayBuffer());
@@ -98,7 +98,7 @@ export async function scanTopLevel(file: Blob): Promise<TopLevelEntry[]> {
 }
 
 /** Reads one scanned box in full, header included. */
-export async function readBox(file: Blob, entry: TopLevelEntry): Promise<Uint8Array> {
+export async function readBox(file: Blob, entry: TopLevelEntry): Promise<Uint8Array<ArrayBuffer>> {
   const bytes = await readRange(file, entry.start, entry.end);
   if (bytes.length !== entry.size) {
     fail(`Could not read all of '${entry.type}': expected ${entry.size} bytes, got ${bytes.length}.`);

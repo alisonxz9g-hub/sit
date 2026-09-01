@@ -11,9 +11,11 @@ import {
   describeMode,
   diagnose,
   estimateSeconds,
+  remuxNatively,
   type Diagnosis,
   type MediaReport,
   type PipelineMode,
+  type PipelinePlan,
 } from '../../core/index';
 import { FfmpegError, isFfmpegLoaded, loadFfmpeg, runFfmpeg } from '../../core/ffmpeg';
 import { append, clear, el, icon } from '../dom';
@@ -215,7 +217,14 @@ export function createOptimizer(): View {
     abort = new AbortController();
     updateControls();
 
-    if (!isFfmpegLoaded()) {
+    // Only fetch the engine if something in the queue actually needs it. Container work
+    // runs on our own writer, and downloading 31 MB to move an index to the front of a
+    // file is what made this tool feel an order of magnitude slower than it is.
+    const needsEngine = pending.some(
+      (job) => job.report && job.mode && buildPlan(job.report, job.mode).engine === 'ffmpeg',
+    );
+
+    if (needsEngine && !isFfmpegLoaded()) {
       progress.indeterminate('loading engine');
       log.write('Loading the transcoding engine (about 31 MB, cached after the first run)...', 'strong');
       try {
@@ -256,28 +265,25 @@ export function createOptimizer(): View {
     renderJob(job);
 
     const plan = buildPlan(job.report, job.mode);
-    const described = describeMode(job.mode);
-    log.write(`${job.file.name}: ${described.title.toLowerCase()} — ${fmt.estimate(estimateSeconds(job.report, job.mode))}`, 'strong');
+    const described = describeMode(job.mode, job.report);
+    log.write(
+      `${job.file.name}: ${described.title.toLowerCase()} via ${plan.engine} — ` +
+        fmt.estimate(estimateSeconds(job.report, job.mode)),
+      'strong',
+    );
+    if (plan.fallbackReason) {
+      log.write(`  direct rewrite declined: ${plan.fallbackReason}`, 'warn');
+    }
 
     progress.set(0, `${job.file.name} — 0%`);
 
     try {
-      const { bytes } = await runFfmpeg({
-        input: job.file,
-        args: plan.args,
-        outputName: plan.outputName,
-        signal,
-        onLog: (line) => {
-          // ffmpeg's per-frame status lines are noise in a log people read.
-          if (/^frame=/.test(line)) return;
-          log.write(line, 'muted');
-        },
-        onProgress: ({ ratio }) => progress.set(ratio, `${job.file.name} — ${fmt.percent(ratio)}`),
-      });
+      const started = performance.now();
+      const blob = plan.engine === 'native'
+        ? await runNative(job, plan)
+        : await runViaFfmpeg(job, plan, signal);
+      const elapsed = performance.now() - started;
 
-      // Copy into a fresh buffer: the view over wasm memory is not stable once the
-      // core continues, and this blob has to outlive the run.
-      const blob = new Blob([new Uint8Array(bytes)], { type: 'video/mp4' });
       const name = fmt.outputName(job.file.name, job.mode === 'master' ? 'master' : 'optimized');
 
       // Re-analyse our own output rather than asserting it worked. If the result does
@@ -288,7 +294,8 @@ export function createOptimizer(): View {
       job.result = { blob, name, report };
       job.state = 'done';
       log.write(
-        `${job.file.name}: done — ${fmt.bytes(blob.size)}, index at the front, output re-checked and valid.`,
+        `${job.file.name}: done in ${elapsed < 1000 ? `${elapsed.toFixed(0)} ms` : `${(elapsed / 1000).toFixed(1)} s`}` +
+          ` — ${fmt.bytes(blob.size)}, index at the front, output re-checked and valid.`,
         'good',
       );
     } catch (error) {
@@ -307,6 +314,46 @@ export function createOptimizer(): View {
     }
 
     renderJob(job);
+  }
+
+  /** Container work, done by our own writer. No engine, no download. */
+  async function runNative(job: Job, plan: PipelinePlan): Promise<Blob> {
+    progress.indeterminate(`${job.file.name} — rewriting index`);
+    const result = await remuxNatively(job.file, { retagRec709: plan.mode === 'retag' });
+    progress.determinate();
+    progress.set(1, `${job.file.name} — 100%`);
+
+    log.write(
+      `  index rebuilt: ${result.moovBytes} B, offsets shifted by ${result.offsetDelta}` +
+        `${result.passes > 1 ? `, settled in ${result.passes} passes` : ''}` +
+        `${result.promotedToCo64 ? ', widened to 64-bit offsets' : ''}`,
+      'muted',
+    );
+    if (result.dropped.length > 0) {
+      log.write(`  dropped padding box(es): ${result.dropped.join(', ')}`, 'muted');
+    }
+    log.write('  media payload referenced, not copied — the bytes never entered memory', 'muted');
+    return result.blob;
+  }
+
+  /** Re-encodes, and container layouts the native writer declined. */
+  async function runViaFfmpeg(job: Job, plan: PipelinePlan, signal: AbortSignal): Promise<Blob> {
+    const { bytes } = await runFfmpeg({
+      input: job.file,
+      args: plan.args,
+      outputName: plan.outputName,
+      signal,
+      onLog: (line) => {
+        // ffmpeg's per-frame status lines are noise in a log people read.
+        if (/^frame=/.test(line)) return;
+        log.write(line, 'muted');
+      },
+      onProgress: ({ ratio }) => progress.set(ratio, `${job.file.name} — ${fmt.percent(ratio)}`),
+    });
+
+    // Copy into a fresh buffer: the view over wasm memory is not stable once the core
+    // continues, and this blob has to outlive the run.
+    return new Blob([new Uint8Array(bytes)], { type: 'video/mp4' });
   }
 
   /* ---------------------------------------------------------------- render --- */
@@ -425,8 +472,9 @@ export function createOptimizer(): View {
     const modes: PipelineMode[] = ['remux', 'retag', 'master'];
 
     const options = modes.map((mode) => {
-      const described = describeMode(mode);
+      const described = describeMode(mode, job.report!);
       const isRecommended = mode === recommended;
+      const engine = buildPlan(job.report!, mode).engine;
       const input = el('input', {
         attrs: {
           type: 'radio',
@@ -449,6 +497,12 @@ export function createOptimizer(): View {
           el('span', { class: 'mode-head' }, [
             el('span', { class: 'mode-title', text: described.title }),
             isRecommended && el('span', { class: 'badge badge-accent', text: 'suggested' }),
+            // Whether a mode needs the 31 MB engine is the difference between milliseconds
+            // and minutes, so it belongs on the option rather than buried in the log.
+            el('span', {
+              class: `badge badge-engine engine-${engine}`,
+              text: engine === 'native' ? 'no download' : 'needs engine',
+            }),
             el('span', {
               class: 'mode-cost',
               text: fmt.estimate(estimateSeconds(job.report!, mode)),
@@ -466,26 +520,45 @@ export function createOptimizer(): View {
 
     if (job.mode) {
       const plan = buildPlan(job.report, job.mode);
-      children.push(
-        el('details', { class: 'plan' }, [
-          el('summary', { text: plan.lossless ? 'Steps (lossless)' : 'Steps (re-encode)' }),
-          el(
-            'ol',
-            { class: 'plan-steps' },
-            plan.steps.map((step) =>
-              el('li', {}, [
-                el('strong', { text: step.label }),
-                el('span', { text: ` — ${step.detail}` }),
-              ]),
-            ),
+      const planDetails = [
+        el('summary', { text: plan.lossless ? 'Steps (lossless)' : 'Steps (re-encode)' }),
+        el(
+          'ol',
+          { class: 'plan-steps' },
+          plan.steps.map((step) =>
+            el('li', {}, [
+              el('strong', { text: step.label }),
+              el('span', { text: ` — ${step.detail}` }),
+            ]),
           ),
+        ),
+      ];
+
+      if (plan.engine === 'native') {
+        planDetails.push(
+          el('p', { class: 'plan-args-label', text: 'Equivalent ffmpeg command, for reference:' }),
+          el('code', {
+            class: 'plan-args',
+            text: `ffmpeg ${plan.args.join(' ').replace('{input}', job.file.name)} ${plan.outputName}`,
+          }),
+          el('p', {
+            class: 'muted small',
+            text:
+              'Shown so the result is checkable, but not what runs. The same rewrite is ' +
+              'done directly here, without loading a transcoder.',
+          }),
+        );
+      } else {
+        planDetails.push(
           el('p', { class: 'plan-args-label', text: 'Exact command:' }),
           el('code', {
             class: 'plan-args',
             text: `ffmpeg ${plan.args.join(' ').replace('{input}', job.file.name)} ${plan.outputName}`,
           }),
-        ]),
-      );
+        );
+      }
+
+      children.push(el('details', { class: 'plan' }, planDetails));
     }
 
     if (job.diagnosis.needsReexport.length > 0) {

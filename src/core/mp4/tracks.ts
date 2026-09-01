@@ -35,6 +35,8 @@ const EMPTY_TIMING: FrameTiming = {
   entryCount: 0,
   distinctDeltas: 0,
   dominantShare: 0,
+  steadyShare: 0,
+  jitterPercent: 0,
 };
 
 const NO_EDIT_LIST: EditListInfo = {
@@ -47,13 +49,27 @@ const NO_EDIT_LIST: EditListInfo = {
 };
 
 /**
- * Share of samples that must use one delta for us to call a track constant frame
- * rate. Encoders routinely give the final frame an odd duration, and a handful of
- * outliers in a 30-minute clip is not what people mean by "variable frame rate".
+ * Share of samples that must sit within tolerance of the reference gap before a track
+ * counts as constant frame rate. Encoders routinely give the final frame an odd
+ * duration, and a handful of outliers in a long clip is not what anyone means by
+ * "variable frame rate".
  */
-const CFR_THRESHOLD = 0.999;
+const CFR_THRESHOLD = 0.995;
 /** Below this we stop making excuses and call it variable. */
 const NEAR_CFR_THRESHOLD = 0.95;
+
+/**
+ * Relative tolerance floor for calling two frame gaps "the same".
+ *
+ * On top of this, at least two ticks of slack are always allowed, because a timescale
+ * that cannot divide evenly by the frame rate forces the muxer to alternate between
+ * neighbouring integers. Milliseconds at 30 fps means gaps of 33 and 34, a 3% spread
+ * that is nonetheless perfectly constant; microseconds at 60 fps means 16666 and 16667,
+ * a 0.006% spread. A single fixed percentage cannot accept both without also accepting
+ * real jitter, so the allowance is expressed in ticks as well.
+ */
+const STEADY_TOLERANCE = 0.01;
+const STEADY_TOLERANCE_TICKS = 2;
 
 /* ------------------------------------------------------------ sample tables --- */
 
@@ -137,9 +153,9 @@ function parseChunkOffsets(stbl: Box | null): { box: 'stco' | 'co64' | null; cou
 function computeTiming(entries: SttsEntry[], timescale: number, durationSec: number): FrameTiming {
   if (entries.length === 0 || timescale <= 0) return EMPTY_TIMING;
 
-  // Collapse to a delta histogram. A zero delta contributes samples but no time,
-  // which happens in files with duplicate timestamps, so it is counted and ignored
-  // for the rate maths.
+  // Collapse to a delta histogram. A zero delta contributes samples but no time, which
+  // happens in files with duplicate timestamps; those are counted in the total but never
+  // treated as steady.
   const histogram = new Map<number, number>();
   let sampleCount = 0;
   for (const { count, delta } of entries) {
@@ -164,19 +180,46 @@ function computeTiming(entries: SttsEntry[], timescale: number, durationSec: num
     }
   }
 
-  const dominantShare = dominantCount / sampleCount;
+  // Reference gap: the sample-weighted median. More robust than the mode when a file
+  // alternates between two neighbouring values, and more robust than the mean when a few
+  // frames have wild durations.
+  const sorted = [...histogram.entries()].filter(([delta]) => delta > 0).sort((a, b) => a[0] - b[0]);
+  let reference = dominantDelta;
+  let seen = 0;
+  const half = sampleCount / 2;
+  for (const [delta, count] of sorted) {
+    seen += count;
+    if (seen >= half) {
+      reference = delta;
+      break;
+    }
+  }
+
+  // Absolute slack in ticks, so a timescale that cannot divide evenly by the frame rate
+  // is not mistaken for jitter.
+  const slack = Math.max(reference * STEADY_TOLERANCE, STEADY_TOLERANCE_TICKS);
+  let steadyCount = 0;
+  for (const [delta, count] of histogram) {
+    if (delta > 0 && Math.abs(delta - reference) <= slack) steadyCount += count;
+  }
+
+  const steadyShare = steadyCount / sampleCount;
   const mode: FrameTiming['mode'] =
-    dominantShare >= CFR_THRESHOLD ? 'cfr' : dominantShare >= NEAR_CFR_THRESHOLD ? 'near-cfr' : 'vfr';
+    steadyShare >= CFR_THRESHOLD ? 'cfr' : steadyShare >= NEAR_CFR_THRESHOLD ? 'near-cfr' : 'vfr';
+
+  const spread = Number.isFinite(minDelta) && maxDelta > 0 ? maxDelta - minDelta : 0;
 
   return {
     mode,
     avgFps: durationSec > 0 ? sampleCount / durationSec : null,
-    nominalFps: dominantDelta > 0 ? timescale / dominantDelta : null,
+    nominalFps: reference > 0 ? timescale / reference : null,
     minFps: maxDelta > 0 ? timescale / maxDelta : null,
     maxFps: Number.isFinite(minDelta) && minDelta > 0 ? timescale / minDelta : null,
     entryCount: entries.length,
     distinctDeltas: histogram.size,
-    dominantShare,
+    dominantShare: dominantCount / sampleCount,
+    steadyShare,
+    jitterPercent: reference > 0 ? (spread / reference) * 100 : 0,
   };
 }
 

@@ -120,15 +120,32 @@ async function main() {
     const suggested = await page.textContent('.mode:has(.badge-accent) .mode-title');
     console.log(`   suggested mode: ${suggested?.trim()}`);
 
-    console.log('3. running it (this downloads the 31 MB engine)');
+    // The engine is 31 MB. Watching for the request is how we prove the lossless path
+    // does not touch it, which is the difference between 20 ms and minutes.
+    const engineRequests = [];
+    page.on('request', (req) => {
+      if (/ffmpeg-core\.(js|wasm)/.test(req.url())) engineRequests.push(req.url());
+    });
+
+    console.log('3. running the suggested (lossless) mode');
+    const startedAt = Date.now();
     await page.click('.queue-bar button.btn-primary');
-
-    // The whole point: the engine has to load and the job has to finish.
     await page.waitForSelector('.job.state-done a.btn-primary[download]', { timeout: 180_000 });
-    console.log('   job completed and a download link appeared');
+    const elapsed = Date.now() - startedAt;
+    console.log(`   job completed in ${elapsed} ms and a download link appeared`);
 
+    assert.deepEqual(
+      engineRequests,
+      [],
+      `the lossless path must not fetch the engine, but requested:\n${engineRequests.join('\n')}`,
+    );
     const engineReady = await page.locator('.log-line', { hasText: 'Engine ready.' }).count();
-    assert.ok(engineReady > 0, 'the log should confirm the engine loaded');
+    assert.equal(engineReady, 0, 'the engine should never have loaded for a container rewrite');
+    assert.ok(
+      await page.locator('.log-line', { hasText: 'index rebuilt' }).count() > 0,
+      'the log should show the index being rewritten natively',
+    );
+    console.log('   engine was never requested (native path confirmed)');
 
     console.log('4. checking the output');
     const result = await page.evaluate(async () => {
@@ -149,13 +166,37 @@ async function main() {
 
     const mode = suggested?.trim() ?? 'unknown';
 
+    // Second phase: the ffmpeg path still has to work, since re-encodes depend on it.
+    // A small fixture keeps this from taking minutes in single-threaded wasm.
+    console.log('5. forcing a re-encode, to exercise the ffmpeg path');
+    await page.click('.job .btn-ghost'); // remove the finished job
+    await page.setInputFiles(
+      '.view-optimizer input[type=file]',
+      path.join(projectRoot, 'test', 'fixtures', 'untagged-color.mp4'),
+    );
+    await page.waitForSelector('.job .modes', { timeout: 30_000 });
+    await page.locator('.mode input[value=master]').check();
+
+    await page.click('.queue-bar button.btn-primary');
+    await page.waitForSelector('.job.state-done a.btn-primary[download]', { timeout: 300_000 });
+
+    assert.ok(engineRequests.length > 0, 'a re-encode should have fetched the engine');
+    assert.ok(
+      await page.locator('.log-line', { hasText: 'Engine ready.' }).count() > 0,
+      'the log should confirm the engine loaded for the re-encode',
+    );
+    console.log(`   re-encode finished; engine fetched ${engineRequests.length} file(s)`);
+
     // Blob URLs show up as failed requests when revoked, so only flag real asset misses.
     const realFailures = failedRequests.filter((f) => !f.includes('blob:'));
     assert.deepEqual(realFailures, [], `requests failed:\n${realFailures.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `console errors:\n${consoleErrors.join('\n')}`);
 
     console.log(
-      `\nBrowser check passed: engine loaded, "${mode}" ran, output is a faststart MP4.`,
+      `\nBrowser check passed:\n` +
+        `  "${mode}" ran natively in ${elapsed} ms with no engine download\n` +
+        `  output is a faststart MP4\n` +
+        `  the ffmpeg path still works for re-encodes`,
     );
   } finally {
     await browser.close();

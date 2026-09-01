@@ -9,7 +9,7 @@ export interface FrameTiming {
   readonly mode: FrameRateMode;
   /** Sample count divided by media duration. What a player reports as "fps". */
   readonly avgFps: number | null;
-  /** Frame rate implied by the most common sample delta. */
+  /** Frame rate implied by the reference (median) sample delta. */
   readonly nominalFps: number | null;
   /** Instantaneous extremes, useful for showing how wide the jitter is. */
   readonly minFps: number | null;
@@ -18,8 +18,24 @@ export interface FrameTiming {
   readonly entryCount: number;
   /** How many distinct frame durations appear. */
   readonly distinctDeltas: number;
-  /** Fraction of samples that use the dominant delta, 0..1. */
+  /** Fraction of samples that use the single most common delta, 0..1. */
   readonly dominantShare: number;
+  /**
+   * Fraction of samples whose gap is within the quantisation tolerance of the reference
+   * gap, 0..1. This, not `dominantShare`, decides `mode`.
+   *
+   * A 60 fps track in a microsecond timescale has to alternate between gaps of 16666 and
+   * 16667 ticks, because 1000000/60 is not an integer. That is two distinct deltas and a
+   * dominant share near 0.67, yet the frame rate is exactly constant. Counting samples
+   * close to the reference instead of samples equal to the mode is what tells those
+   * apart.
+   */
+  readonly steadyShare: number;
+  /**
+   * How much the frame gaps actually vary, as a percentage of the reference gap. This is
+   * the number worth showing a person: 0.01% is timescale rounding, 40% is real jitter.
+   */
+  readonly jitterPercent: number;
 }
 
 export interface ColorInfo {

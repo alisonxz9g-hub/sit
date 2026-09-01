@@ -132,15 +132,15 @@ function timingFindings(video: Track): Finding[] {
       severity: 'warning',
       title: 'Variable frame rate',
       detail:
-        'Frame gaps are uneven, which is normal for screen recordings and phone ' +
-        'cameras but the single most common cause of judder after a platform ' +
+        'Frame gaps are genuinely uneven, which is normal for screen recordings and ' +
+        'phone cameras but the single most common cause of judder after a platform ' +
         're-encode: its encoder assumes a constant rate and resamples your timing to ' +
         'get one. Converting to constant frame rate here means you choose where frames ' +
         'land instead of it.',
       evidence:
-        `${timing.distinctDeltas} distinct frame durations, ` +
-        `${(timing.dominantShare * 100).toFixed(1)}% on the most common one ` +
-        `(${fpsLabel(timing.minFps)} to ${fpsLabel(timing.maxFps)})`,
+        `gaps vary by ${timing.jitterPercent.toFixed(1)}% ` +
+        `(${fpsLabel(timing.minFps)} to ${fpsLabel(timing.maxFps)}), ` +
+        `${(timing.steadyShare * 100).toFixed(1)}% of frames on the reference gap`,
       fix: 'master',
     });
   } else if (timing.mode === 'near-cfr') {
@@ -150,8 +150,11 @@ function timingFindings(video: Track): Finding[] {
       title: 'Nearly constant frame rate',
       detail:
         'A small number of frames sit off the grid. This is usually harmless and often ' +
-        'just the final frame, so it is not worth a re-encode on its own.',
-      evidence: `${(timing.dominantShare * 100).toFixed(1)}% of frames at ${fpsLabel(timing.nominalFps)}`,
+        'just the final frame or a couple of dropped ones, so it is not worth a ' +
+        're-encode on its own.',
+      evidence:
+        `${(timing.steadyShare * 100).toFixed(1)}% of frames at ${fpsLabel(timing.nominalFps)}, ` +
+        `outliers up to ${timing.jitterPercent.toFixed(0)}% off`,
       fix: 'none',
     });
   }

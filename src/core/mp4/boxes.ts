@@ -22,6 +22,15 @@ export interface Box {
    * boxes expose `children` instead so we never hold two views of the same range.
    */
   readonly payload: Uint8Array | null;
+  /**
+   * Bytes that sit between the header and the first child, for containers that have
+   * any. Only ISO-flavoured `meta` does: it is a FullBox, so a version and flags word
+   * precedes its children, while the QuickTime flavour has nothing there.
+   *
+   * Without this the tree could not be serialised back losslessly, and dropping four
+   * bytes in the middle of a `meta` box corrupts every offset after it.
+   */
+  readonly prefix: Uint8Array | null;
   readonly children: Box[] | null;
 }
 
@@ -149,6 +158,7 @@ export function parseBoxes(
       boxes.push({
         ...common,
         payload: null,
+        prefix: null,
         children: parseBoxes(reader, payloadStart, payloadEnd, {
           strict,
           parentType: type,
@@ -156,11 +166,13 @@ export function parseBoxes(
         }),
       });
     } else if (type === 'meta') {
-      const inner = payloadStart + metaPayloadStart(reader.subarray(payloadStart, payloadEnd));
+      const skip = metaPayloadStart(reader.subarray(payloadStart, payloadEnd));
+      const inner = Math.min(payloadStart + skip, payloadEnd);
       boxes.push({
         ...common,
         payload: null,
-        children: parseBoxes(reader, Math.min(inner, payloadEnd), payloadEnd, {
+        prefix: skip > 0 ? reader.subarray(payloadStart, inner) : null,
+        children: parseBoxes(reader, inner, payloadEnd, {
           strict,
           parentType: 'meta',
           depth: depth + 1,
@@ -172,6 +184,7 @@ export function parseBoxes(
         // `mdat` payloads are never materialised: at the top level we parse headers
         // only, and inside moov there is no mdat to begin with.
         payload: type === 'mdat' ? null : reader.subarray(payloadStart, payloadEnd),
+        prefix: null,
         children: null,
       });
     }

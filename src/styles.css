@@ -1195,3 +1195,22 @@ summary::-webkit-details-marker {
 .table tbody tr:last-child td {
   border-bottom: none;
 }
+
+/* Which engine a mode uses is the difference between milliseconds and minutes, so it is
+   called out on the option itself. */
+.badge-engine {
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+
+.badge-engine.engine-native {
+  background: rgb(74 222 128 / 0.12);
+  border-color: rgb(74 222 128 / 0.32);
+  color: var(--good);
+}
+
+.badge-engine.engine-ffmpeg {
+  background: rgb(251 191 36 / 0.1);
+  border-color: rgb(251 191 36 / 0.28);
+  color: var(--warn);
+}

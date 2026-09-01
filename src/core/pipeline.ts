@@ -1,18 +1,24 @@
 /**
- * Builds the ffmpeg invocation for each mode from what the analysis actually found,
- * rather than applying a fixed recipe to every file.
+ * Chooses how to process a file, from what the analysis actually found rather than by
+ * applying a fixed recipe.
  *
  * Three modes, cheapest first:
  *
- *   remux   Rebuilds the container and moves the index to the front. Stream copy, so
- *           the pixels and samples are bit-identical. Seconds, whatever the length.
- *   retag   A remux that also writes the Rec.709 colour tags. Still a stream copy:
- *           the tags live in a container box, the bitstream is untouched. Verified
- *           against ffmpeg 9 that `-c copy` does carry the colour options through to
- *           the muxer, which is not true when encoding.
- *   master  A real re-encode. The only mode that can change frame timing, resolution
- *           or chroma format, and the only one that costs quality. Used when the
- *           source is variable frame rate, off the delivery ladder, or not 4:2:0.
+ *   remux   Rebuilds the container and moves the index to the front. The media payload
+ *           is copied verbatim, so pixels and samples are bit-identical.
+ *   retag   A remux that also writes the Rec.709 colour tags. Still lossless: the tags
+ *           live in a container box and the bitstream is untouched.
+ *   master  A real re-encode. The only mode that can change frame timing, resolution or
+ *           chroma format, and the only one that costs quality. Used when the source is
+ *           variable frame rate, off the delivery ladder, or not 4:2:0.
+ *
+ * The first two run on our own box writer, in milliseconds, with no engine download at
+ * all. That matters more than it sounds: an earlier version routed every mode through a
+ * WebAssembly build of ffmpeg, so moving an index to the front of a 33 MB file meant
+ * fetching 31 MB of engine and loading the whole video into wasm memory. The same job
+ * natively is arithmetic over a few thousand integers and takes about 20 ms. ffmpeg is
+ * still there for re-encodes, and as a fallback for container layouts the native writer
+ * refuses to touch.
  *
  * Nothing here writes a deliberately malformed file. Every output is a spec-valid MP4
  * that any player, uploader or validator will accept.
@@ -20,9 +26,18 @@
 import type { MasterPlan } from './diagnose';
 import { planMaster } from './diagnose';
 import type { MediaReport } from './mp4/index';
+import { canRemuxNatively } from './remux';
 import { AUDIO_TARGET } from './targets';
 
 export type PipelineMode = 'remux' | 'retag' | 'master';
+
+/**
+ * Which implementation runs the job.
+ * - `native` uses our own MP4 writer: no download, no wasm, milliseconds.
+ * - `ffmpeg` uses ffmpeg.wasm: needed for re-encodes, and for container layouts the
+ *   native writer declines.
+ */
+export type PipelineEngine = 'native' | 'ffmpeg';
 
 export interface PipelineStep {
   readonly label: string;
@@ -31,7 +46,11 @@ export interface PipelineStep {
 
 export interface PipelinePlan {
   readonly mode: PipelineMode;
-  /** Argument list, excluding the trailing output name. `{input}` is substituted. */
+  readonly engine: PipelineEngine;
+  /**
+   * Argument list for the ffmpeg path, excluding the trailing output name. `{input}` is
+   * substituted at run time. Empty for native plans.
+   */
   readonly args: readonly string[];
   readonly outputName: string;
   /** True when no sample is re-encoded. */
@@ -39,6 +58,8 @@ export interface PipelinePlan {
   readonly steps: readonly PipelineStep[];
   /** Encode settings, for `master` only. */
   readonly master: MasterPlan | null;
+  /** Set when a lossless mode had to fall back to ffmpeg, with the reason. */
+  readonly fallbackReason: string | null;
 }
 
 /**
@@ -74,11 +95,21 @@ function mapArgs(report: MediaReport): string[] {
 }
 
 function buildRemux(report: MediaReport, retag: boolean): PipelinePlan {
+  const native = canRemuxNatively(report);
+  const mode: PipelineMode = retag ? 'retag' : 'remux';
+
+  const steps: PipelineStep[] = native.supported
+    ? nativeSteps(report, retag)
+    : ffmpegRemuxSteps(report, retag, native.reason);
+
+  // The ffmpeg argument list is built either way, so the UI can always show a command
+  // and so the fallback needs no second code path.
+  //
   // Deliberately minimal. An earlier version added `-avoid_negative_ts make_zero`
   // believing it would drop the edit list; measured against ffmpeg 9 it replaces one
-  // benign delay-compensation entry with two, including an empty edit that inserts
-  // blank presentation time. Plain stream copy preserves the source timeline exactly,
-  // which is what a lossless remux should mean.
+  // benign delay-compensation entry with two, including an empty edit that inserts blank
+  // presentation time. Plain stream copy preserves the source timeline exactly, which is
+  // what a lossless remux should mean.
   const args = [
     '-i', '{input}',
     ...mapArgs(report),
@@ -87,41 +118,83 @@ function buildRemux(report: MediaReport, retag: boolean): PipelinePlan {
     '-movflags', '+faststart',
   ];
 
-  const steps: PipelineStep[] = [
-    {
-      label: 'Copy streams',
-      detail: 'Video and audio are copied sample for sample. Nothing is re-encoded.',
-    },
-    {
-      label: 'Move index to the front',
-      detail: 'The moov index is written before the media so readers do not have to seek.',
-    },
-  ];
-
-  if (retag) {
-    steps.splice(1, 0, {
-      label: 'Tag colour as Rec.709',
-      detail:
-        'Writes the colour primaries, transfer function and matrix into the container. ' +
-        'This is metadata only; not a single pixel changes.',
-    });
-  }
-
-  if (!report.audio) {
-    steps.push({
-      label: 'No audio track',
-      detail: 'The source is silent, so none is written.',
-    });
-  }
-
   return {
-    mode: retag ? 'retag' : 'remux',
+    mode,
+    engine: native.supported ? 'native' : 'ffmpeg',
     args,
     outputName: 'output.mp4',
     lossless: true,
     steps,
     master: null,
+    fallbackReason: native.supported ? null : native.reason,
   };
+}
+
+function nativeSteps(report: MediaReport, retag: boolean): PipelineStep[] {
+  const steps: PipelineStep[] = [
+    {
+      label: 'Rewrite the index',
+      detail:
+        'The moov index is rebuilt with every chunk offset corrected for its new ' +
+        'position, then written before the media instead of after it.',
+    },
+  ];
+
+  if (retag) {
+    steps.push({
+      label: 'Tag colour as Rec.709',
+      detail:
+        'Writes the colour primaries, transfer function and matrix into the video ' +
+        'sample entry. Metadata only; not a single pixel changes.',
+    });
+  }
+
+  steps.push({
+    label: 'Reference the payload, do not copy it',
+    detail:
+      'The media is attached as a slice of the original file, so those bytes go straight ' +
+      'to the download without passing through memory. This is why a 500 MB file costs ' +
+      'no more than a small one.',
+  });
+
+  if (!report.audio) {
+    steps.push({ label: 'No audio track', detail: 'The source is silent, so none is written.' });
+  }
+
+  return steps;
+}
+
+function ffmpegRemuxSteps(report: MediaReport, retag: boolean, reason: string): PipelineStep[] {
+  const steps: PipelineStep[] = [
+    {
+      label: 'Use the transcoding engine',
+      detail:
+        `The direct rewriter declined this file because ${reason}. ffmpeg handles it ` +
+        'instead, which means downloading the engine first.',
+    },
+    {
+      label: 'Copy streams',
+      detail: 'Video and audio are copied sample for sample. Nothing is re-encoded.',
+    },
+  ];
+
+  if (retag) {
+    steps.push({
+      label: 'Tag colour as Rec.709',
+      detail: 'Colour metadata is written into the container. No pixel changes.',
+    });
+  }
+
+  steps.push({
+    label: 'Move index to the front',
+    detail: 'The moov index is written before the media so readers do not have to seek.',
+  });
+
+  if (!report.audio) {
+    steps.push({ label: 'No audio track', detail: 'The source is silent, so none is written.' });
+  }
+
+  return steps;
 }
 
 function buildMaster(report: MediaReport): PipelinePlan {
@@ -211,11 +284,13 @@ function buildMaster(report: MediaReport): PipelinePlan {
 
   return {
     mode: 'master',
+    engine: 'ffmpeg',
     args,
     outputName: 'output.mp4',
     lossless: false,
     steps,
     master: plan,
+    fallbackReason: null,
   };
 }
 
@@ -232,12 +307,22 @@ export function buildPlan(report: MediaReport, mode: PipelineMode): PipelinePlan
 
 /**
  * Very rough wall-clock guess, so the UI can set expectations before a run that might
- * take minutes. Stream copies are IO-bound and quick; encodes are not.
+ * take minutes.
+ *
+ * The native path is fast enough that the only real cost is the browser writing the
+ * output, so it is reported as effectively instant. An ffmpeg stream copy has to move the
+ * whole file into wasm memory first, and an encode is in another league entirely.
  */
 export function estimateSeconds(report: MediaReport, mode: PipelineMode): number {
   const duration = report.durationSec || 1;
+
   if (mode !== 'master') {
-    // Dominated by reading and writing the file, not by ffmpeg.
+    const plan = buildPlan(report, mode);
+    if (plan.engine === 'native') {
+      // Measured at about 20 ms for a 33 MB file, dominated by reading the index.
+      return Math.max(0.2, (report.fileSize / 1_000_000) * 0.002);
+    }
+    // Dominated by shuttling the file through wasm memory, not by ffmpeg itself.
     return Math.max(2, Math.round((report.fileSize / 1_000_000) * 0.08));
   }
 
@@ -250,24 +335,40 @@ export function estimateSeconds(report: MediaReport, mode: PipelineMode): number
   return Math.max(5, Math.round((pixels * framesToEncode) / 2_000_000));
 }
 
-export function describeMode(mode: PipelineMode): { title: string; summary: string } {
+/**
+ * Mode description, adjusted for how the job will actually run. Passing the report lets
+ * the copy say "instantly, no download" when that is true instead of hedging.
+ */
+export function describeMode(
+  mode: PipelineMode,
+  report?: MediaReport,
+): { title: string; summary: string } {
+  const engine = report ? buildPlan(report, mode).engine : null;
+
   switch (mode) {
     case 'remux':
       return {
         title: 'Remux',
-        summary: 'Rebuild the container and move the index to the front. Lossless, seconds.',
+        summary:
+          engine === 'native'
+            ? 'Rewrite the index and move it to the front. Lossless, instant, no engine download.'
+            : 'Rebuild the container and move the index to the front. Lossless.',
       };
     case 'retag':
       return {
         title: 'Remux + colour tags',
-        summary: 'Everything remux does, plus Rec.709 tagging. Still lossless.',
+        summary:
+          engine === 'native'
+            ? 'Everything remux does, plus Rec.709 tagging. Still lossless and instant.'
+            : 'Everything remux does, plus Rec.709 tagging. Still lossless.',
       };
     case 'master':
       return {
         title: 'Re-encode',
         summary:
           'Normalise frame timing, resolution and chroma at a high bitrate. The only ' +
-          'mode that can fix timing, and the only one that costs quality.',
+          'mode that can fix timing, the only one that costs quality, and the only one ' +
+          'that needs the 31 MB engine.',
       };
   }
 }

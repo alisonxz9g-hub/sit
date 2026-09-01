@@ -38,14 +38,38 @@ Two related commitments:
 
 ## The three modes
 
-| Mode | What it does | Lossless | Cost |
-| --- | --- | --- | --- |
-| **Remux** | Rebuilds the container, moves the index to the front, flattens fragments, drops edit lists | Yes — bit-identical streams | Seconds |
-| **Retag** | Remux plus Rec.709 colour tags written into the container | Yes — metadata only | Seconds |
-| **Re-encode** | Normalises frame timing, resolution, chroma and audio at high bitrate | No | Minutes |
+| Mode | What it does | Lossless | Engine | Cost |
+| --- | --- | --- | --- | --- |
+| **Remux** | Rewrites the index and moves it to the front, drops padding boxes | Yes — bit-identical streams | native | ~20 ms |
+| **Retag** | Remux plus Rec.709 colour tags written into the video sample entry | Yes — metadata only | native | ~20 ms |
+| **Re-encode** | Normalises frame timing, resolution, chroma and audio at high bitrate | No | ffmpeg.wasm | Minutes |
 
 The app picks the cheapest mode that resolves what it found, and explains why. You can
-override it, and the exact `ffmpeg` command is shown before you run anything.
+override it, and the exact command is shown before you run anything.
+
+### Why the lossless modes are instant
+
+Moving an MP4's index to the front is bookkeeping, not transcoding. The media payload does
+not change at all; the only thing that changes is the chunk offset table saying where each
+piece of it starts. So the first two modes run on this project's own box writer, in
+milliseconds, with **no engine download at all**.
+
+Two details make that possible:
+
+- The payload is never read. The output is assembled as a `Blob` whose last part is a slice
+  of the source `File`, so the browser streams those bytes from disk straight to the
+  download. A 500 MB input costs about as much memory as a 5 MB one.
+- Promoting `stco` to `co64` grows the index, which moves the payload, which changes the
+  offsets. The layout is solved by iterating to a fixed point rather than assuming one pass.
+
+Measured on a 33 MB 2560x1440 60 fps clip: **20 ms**, output decodes to a bit-identical MD5.
+An earlier version routed every mode through ffmpeg.wasm, so the same job meant fetching
+31 MB of engine and loading the whole video into wasm memory — minutes instead of
+milliseconds, for arithmetic over a few thousand integers.
+
+ffmpeg is still used for re-encodes, and as a fallback for container layouts the native
+writer declines: fragmented files, multiple `mdat` boxes, or unexpected top-level boxes.
+Falling back is logged with the reason.
 
 ## Architecture
 
@@ -55,13 +79,15 @@ src/
     mp4/
       reader.ts    bounds-checked big-endian reader
       boxes.ts     box tree parser
+      write.ts     box serialiser + chunk offset rewriting
       scan.ts      streaming top-level scan via Blob.slice
       codecs.ts    avcC / hvcC / colr / esds decoders + enum tables
       tracks.ts    sample tables -> frame timing, bitrate, rotation
       analyze.ts   orchestration
     targets.ts     delivery resolutions and bitrate heuristics
     diagnose.ts    report -> findings, each with a concrete fix
-    pipeline.ts    findings -> ffmpeg argument list
+    remux.ts       native faststart + colour tagging, no ffmpeg
+    pipeline.ts    findings -> mode, engine and arguments
     ffmpeg.ts      ffmpeg.wasm lifecycle (browser only)
   ui/              vanilla TypeScript, no framework
 ```
@@ -79,6 +105,15 @@ frame rate. Bitrate comes from summing actual sample sizes in `stsz`. Rotation c
 the `tkhd` transform matrix, and the app exposes an *oriented* frame size, because a
 rotated phone export is stored landscape with a 90-degree matrix and neither the coded nor
 the `tkhd` display size answers "is this 1080x1920 portrait?" on its own.
+
+**Frame rate is judged by dispersion, not by distribution.** A 60 fps track in a microsecond
+timescale has to alternate between gaps of 16666 and 16667 ticks, because 1000000/60 is not
+an integer. That is two distinct frame durations with neither exceeding 67% of the samples,
+and it is exactly 60 fps. An earlier classifier counted samples on the most common gap and
+called such files variable, then recommended re-encoding them. The current one measures how
+far gaps actually stray from the median, with a tolerance expressed in ticks as well as
+percent — milliseconds at 30 fps forces gaps of 33 and 34, a 3% spread that is also
+constant.
 
 ## Getting started
 
@@ -108,7 +143,7 @@ third party learns what anyone transcodes.
 
 ## Testing
 
-71 tests across three files, plus two out-of-band checks. The approach matters more than
+93 tests across three files, plus two out-of-band checks. The approach matters more than
 the count.
 
 **The parser is cross-validated against ffprobe.** `npm run fixtures` uses a local ffmpeg
@@ -125,6 +160,12 @@ with our own parser. It checks the claim rather than the exit code: that remux a
 leave the video payload identical byte for byte, that retag really does add an `nclx`
 `colr` box, that a re-encode converts variable frame rate to constant, and that a rotated
 source comes out upright without being upscaled.
+
+**The native writer is held to a higher bar**, because a wrong chunk offset produces a file
+that parses, reports the correct duration, and plays noise. Two properties are asserted:
+the moov round-trips byte for byte when nothing is edited, and every native output decodes
+to the same MD5 as its source. Only decoding catches an offset error, so decoding is what
+the tests do — for every fixture, in both modes.
 
 **The UI is smoke-tested under jsdom**, including a hostile filename
 (`<img src=x onerror=...>`) driven through the real intake path to confirm untrusted text

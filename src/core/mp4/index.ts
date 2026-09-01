@@ -3,6 +3,22 @@ export { parseBoxes, child, children, path, payloadAt, findAll } from './boxes';
 export { scanTopLevel, readBox } from './scan';
 export { Reader } from './reader';
 export {
+  serialize,
+  measure,
+  toMutable,
+  mutableChild,
+  mutablePath,
+  mutableFindAll,
+  readChunkOffsets,
+  writeChunkOffsets,
+  allChunkOffsetTables,
+  concat,
+  u32,
+  u64,
+  fourcc,
+} from './write';
+export type { MutableBox, ChunkOffsetTable } from './write';
+export {
   AVC_FORMATS,
   HEVC_FORMATS,
   codecLabel,

@@ -82,6 +82,7 @@ export async function analyzeFile(file: File): Promise<MediaReport> {
     headerSize: moovEntry.headerSize,
     end: moovEntry.end,
     payload: null,
+    prefix: null,
     // Offsets here are local to `moovBytes`; the parser adds `base` back when it
     // records each box, so Box.start stays a file offset.
     children: parseBoxes(moovReader, moovEntry.headerSize, moovBytes.length, {

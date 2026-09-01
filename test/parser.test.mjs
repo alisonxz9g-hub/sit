@@ -6,15 +6,53 @@
  * than to numbers written by hand. Run `npm run fixtures` first.
  */
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
+import { promisify } from 'node:util';
 
-import { analyzeFile, diagnose } from './.build/core.mjs';
+import {
+  analyzeFile,
+  diagnose,
+  measure,
+  parseBoxes,
+  Reader,
+  scanTopLevel,
+  serialize,
+  toMutable,
+} from './.build/core.mjs';
 
+const run = promisify(execFile);
 const fixtureDir = path.join(import.meta.dirname, 'fixtures');
 
 let groundTruth;
+let scratch;
+
+after(async () => {
+  if (scratch) await rm(scratch, { recursive: true, force: true });
+});
+
+/**
+ * Re-muxes a clip so its video track uses the given timescale, without touching the
+ * bitstream. Used to synthesise the case where the timescale cannot divide evenly by the
+ * frame rate, which no fixture produces naturally.
+ */
+async function remuxWithTimescale(sourceBytes, timescale) {
+  scratch ??= await mkdtemp(path.join(tmpdir(), 'timescale-'));
+  const input = path.join(scratch, 'in.mp4');
+  const output = path.join(scratch, `out-${timescale}.mp4`);
+  await writeFile(input, sourceBytes);
+  await run('ffmpeg', [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+    '-i', input,
+    '-c', 'copy',
+    '-video_track_timescale', String(timescale),
+    output,
+  ], { maxBuffer: 64 * 1024 * 1024 });
+  return readFile(output);
+}
 
 before(async () => {
   try {
@@ -182,6 +220,27 @@ describe('structural properties', () => {
     assert.equal(report.video.timing.mode, 'cfr');
     assert.equal(report.video.timing.distinctDeltas, 1);
     assert.equal(report.video.timing.dominantShare, 1);
+    assert.equal(report.video.timing.steadyShare, 1);
+    assert.equal(report.video.timing.jitterPercent, 0);
+  });
+
+  it('treats timescale rounding as constant, not variable', async () => {
+    // Synthesised rather than fixtured, because the case needs a timescale that cannot
+    // divide evenly by the frame rate. A 60 fps track in microseconds must alternate
+    // between gaps of 16666 and 16667, giving two distinct deltas and a dominant share
+    // near 0.67 while being exactly 60 fps. An earlier classifier read that as variable
+    // and recommended re-encoding perfectly good files.
+    const source = await readFile(path.join(fixtureDir, 'landscape-60fps.mp4'));
+    const rebuilt = await remuxWithTimescale(source, 1_000_000);
+    const report = await analyzeFile(new File([rebuilt], 'microsecond-60.mp4', { type: 'video/mp4' }));
+    const { timing } = report.video;
+
+    assert.equal(timing.mode, 'cfr', `expected cfr, got ${timing.mode}`);
+    assert.ok(timing.distinctDeltas >= 2, 'the timescale should force more than one gap value');
+    assert.ok(timing.dominantShare < 0.95, 'no single gap value should dominate');
+    assert.equal(timing.steadyShare, 1, 'every gap should still count as steady');
+    assert.ok(timing.jitterPercent < 0.1, `jitter should be negligible, got ${timing.jitterPercent}%`);
+    assert.ok(Math.abs(timing.nominalFps - 60) < 0.01, `expected ~60 fps, got ${timing.nominalFps}`);
   });
 
   it('classifies a jittered track as variable frame rate', async () => {
@@ -270,6 +329,47 @@ describe('structural properties', () => {
     const report = await analyzeFile(await loadFixture('portrait-cfr-faststart.mp4'));
     assert.equal(report.fragmented, false);
     assert.equal(report.hasLargeBoxes, false);
+  });
+});
+
+describe('box serialisation', () => {
+  it('writes an untouched moov back byte for byte', async () => {
+    // The invariant the native remux rests on. It rebuilds the index after editing only
+    // the offset tables, so any box it did not touch must survive exactly. Losing even
+    // four bytes in the middle of the tree shifts everything after it.
+    for (const name of ALL_FIXTURES) {
+      if (!groundTruth.fixtures[name]) continue;
+
+      const bytes = new Uint8Array(await readFile(path.join(fixtureDir, name)));
+      const entries = await scanTopLevel(new Blob([bytes]));
+      const moovEntry = entries.find((e) => e.type === 'moov');
+      assert.ok(moovEntry, `${name} should have a moov`);
+
+      const original = bytes.subarray(moovEntry.start, moovEntry.end);
+      const reader = new Reader(original, moovEntry.start);
+      const tree = {
+        type: 'moov',
+        payload: null,
+        prefix: null,
+        children: parseBoxes(reader, moovEntry.headerSize, original.length, {
+          strict: true,
+          parentType: 'moov',
+        }),
+      };
+
+      const written = serialize(toMutable(tree));
+      assert.equal(written.length, original.length, `${name}: moov length changed`);
+      assert.equal(measure(toMutable(tree)), original.length, `${name}: measure() disagrees`);
+
+      let firstDiff = -1;
+      for (let i = 0; i < original.length; i++) {
+        if (written[i] !== original[i]) {
+          firstDiff = i;
+          break;
+        }
+      }
+      assert.equal(firstDiff, -1, `${name}: bytes differ at moov+${firstDiff}`);
+    }
   });
 });
 

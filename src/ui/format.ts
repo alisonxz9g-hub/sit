@@ -56,8 +56,16 @@ export function sizeDelta(before: number, after: number): { text: string; tone: 
   return { text, tone: delta > 0 ? 'warn' : 'good' };
 }
 
-/** Rough duration for a pending job, phrased so nobody reads it as a promise. */
+/**
+ * Rough duration for a pending job, phrased so nobody reads it as a promise.
+ *
+ * The sub-second band is spelled out rather than folded into "a few seconds". The whole
+ * point of the native path is that it is instant, and rounding 20 ms up to the same phrase
+ * as a three second wait throws away the only information the reader wanted.
+ */
 export function estimate(seconds: number): string {
+  if (seconds < 0.5) return 'instant';
+  if (seconds < 2) return 'under a second';
   if (seconds < 10) return 'a few seconds';
   if (seconds < 60) return `around ${Math.round(seconds / 5) * 5} seconds`;
   const minutes = seconds / 60;

@@ -18,6 +18,9 @@
     "smoke": "node scripts/smoke-dist.mjs",
     "browser-check": "node scripts/browser-check.mjs",
     "explain": "node scripts/explain.mjs",
+    "try-remux": "node scripts/try-remux.mjs",
+    "compare": "node scripts/compare.mjs",
+    "timing": "node scripts/timing-table.mjs",
     "pretest": "node scripts/build-test-bundle.mjs",
     "test": "node --test test/*.test.mjs"
   },

@@ -7,3 +7,4 @@ export * from './mp4/index';
 export * from './targets';
 export * from './diagnose';
 export * from './pipeline';
+export * from './remux';

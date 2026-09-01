@@ -15,7 +15,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
-import { analyzeFile, buildPlan, diagnose } from './.build/core.mjs';
+import { analyzeFile, buildPlan, canRemuxNatively, diagnose, remuxNatively } from './.build/core.mjs';
 
 const run = promisify(execFile);
 const fixtureDir = path.join(import.meta.dirname, 'fixtures');
@@ -296,3 +296,167 @@ async function fixtureExists(name) {
     return false;
   }
 }
+
+/* ------------------------------------------------------------ native remux --- */
+
+/** Writes a blob out so ffmpeg can be pointed at it. */
+async function writeBlob(blob, name) {
+  const target = path.join(workDir, name);
+  await writeFile(target, Buffer.from(await blob.arrayBuffer()));
+  return target;
+}
+
+/**
+ * Decodes every frame and returns a hash of the result.
+ *
+ * This is the check that matters for a container rewrite. A wrong chunk offset produces a
+ * file that parses, reports the right duration, and plays noise; only decoding catches it.
+ * Comparing the hash to the source proves the pixels are untouched.
+ */
+async function decodedVideoHash(file) {
+  const { stdout, stderr } = await run(
+    'ffmpeg',
+    ['-nostdin', '-hide_banner', '-v', 'error', '-i', file,
+      '-map', '0:v:0', '-f', 'hash', '-hash', 'md5', '-'],
+    { maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (stderr.trim() !== '') {
+    throw new Error(`ffmpeg reported errors while decoding ${path.basename(file)}: ${stderr.trim()}`);
+  }
+  return stdout.trim();
+}
+
+describe('native remux', () => {
+  const cases = [
+    'portrait-no-faststart.mp4',
+    'portrait-cfr-faststart.mp4',
+    'landscape-60fps.mp4',
+    'untagged-color.mp4',
+    'no-audio.mp4',
+    'rotated-90.mp4',
+    'mono-44k-audio.mp4',
+  ];
+
+  it('is the chosen engine for ordinary files', async () => {
+    for (const name of cases) {
+      const report = await analyzeFile(await loadFixture(name));
+      assert.equal(canRemuxNatively(report).supported, true, `${name} should be natively remuxable`);
+      for (const mode of ['remux', 'retag']) {
+        const plan = buildPlan(report, mode);
+        assert.equal(plan.engine, 'native', `${name} ${mode} should run natively`);
+        assert.equal(plan.fallbackReason, null);
+      }
+      // A re-encode always needs the engine; nothing native can change frame timing.
+      assert.equal(buildPlan(report, 'master').engine, 'ffmpeg');
+    }
+  });
+
+  for (const name of cases) {
+    for (const retag of [false, true]) {
+      const label = retag ? 'retag' : 'remux';
+      it(`${label} of ${name} is lossless and decodes identically`, async () => {
+        const source = path.join(fixtureDir, name);
+        const before = await analyzeFile(await loadFixture(name));
+
+        const result = await remuxNatively(await loadFixture(name), { retagRec709: retag });
+        const outPath = await writeBlob(result.blob, `native-${label}-${name}`);
+        const after = await analyzeFile(
+          new File([await readFile(outPath)], `out-${name}`, { type: 'video/mp4' }),
+        );
+
+        assert.equal(after.faststart, true, 'output should be faststart');
+        assert.equal(after.fragmented, false);
+        assert.equal(after.tracks.length, before.tracks.length, 'track count should be preserved');
+        assert.equal(after.video.sampleCount, before.video.sampleCount, 'frame count should match');
+        assert.equal(
+          after.video.byteLength,
+          before.video.byteLength,
+          'video payload should be identical',
+        );
+        assert.equal(
+          after.audio?.byteLength ?? 0,
+          before.audio?.byteLength ?? 0,
+          'audio payload should be identical',
+        );
+        assert.ok(
+          Math.abs(after.durationSec - before.durationSec) < 0.002,
+          `duration should be preserved (${after.durationSec} vs ${before.durationSec})`,
+        );
+
+        if (retag) {
+          const { color } = after.video;
+          assert.equal(color.present, true, 'a colr box should be present');
+          assert.deepEqual([color.primaries, color.transfer, color.matrix], [1, 1, 1]);
+        }
+
+        // The proof: same decoded pixels, so the offsets are right.
+        const [hashBefore, hashAfter] = await Promise.all([
+          decodedVideoHash(source),
+          decodedVideoHash(outPath),
+        ]);
+        assert.equal(hashAfter, hashBefore, 'decoded video should be bit-identical');
+      });
+    }
+  }
+
+  it('inserts a colr box when the source has none, growing the index', async () => {
+    const plain = await remuxNatively(await loadFixture('untagged-color.mp4'));
+    const tagged = await remuxNatively(await loadFixture('untagged-color.mp4'), { retagRec709: true });
+
+    assert.ok(
+      tagged.moovBytes > plain.moovBytes,
+      `tagging should grow the index (${plain.moovBytes} -> ${tagged.moovBytes})`,
+    );
+    // A 'colr' box with an 11-byte nclx payload plus its 8-byte header.
+    assert.equal(tagged.moovBytes - plain.moovBytes, 19);
+  });
+
+  it('drops padding boxes and reports doing so', async () => {
+    const result = await remuxNatively(await loadFixture('portrait-cfr-faststart.mp4'));
+    assert.ok(result.dropped.includes('free'), `expected a free box to be dropped, got ${result.dropped}`);
+  });
+
+  it('settles the layout in a single pass for ordinary files', async () => {
+    const result = await remuxNatively(await loadFixture('portrait-no-faststart.mp4'));
+    assert.equal(result.passes, 1);
+    assert.equal(result.promotedToCo64, false);
+  });
+
+  it('declines a fragmented file and falls back to ffmpeg', async () => {
+    const fragmented = path.join(workDir, 'native-fragmented.mp4');
+    await run('ffmpeg', [
+      '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+      '-i', path.join(fixtureDir, 'portrait-cfr-faststart.mp4'),
+      '-c', 'copy',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      fragmented,
+    ]);
+
+    const report = await analyzeFile(
+      new File([await readFile(fragmented)], 'fragmented.mp4', { type: 'video/mp4' }),
+    );
+
+    const support = canRemuxNatively(report);
+    assert.equal(support.supported, false, 'a fragmented file should not take the native path');
+    assert.match(support.reason, /fragment/i);
+
+    const plan = buildPlan(report, 'remux');
+    assert.equal(plan.engine, 'ffmpeg', 'the plan should fall back');
+    assert.ok(plan.fallbackReason, 'the fallback should carry a reason');
+    assert.equal(plan.lossless, true, 'falling back does not make it lossy');
+  });
+
+  it('estimates the native path as effectively instant', async () => {
+    const report = await analyzeFile(await loadFixture('portrait-no-faststart.mp4'));
+    // Imported lazily so the estimate helper stays an implementation detail of the core.
+    const { estimateSeconds } = await import('./.build/core.mjs');
+    assert.ok(
+      estimateSeconds(report, 'remux') < 1,
+      'a native remux should be estimated under a second',
+    );
+    assert.ok(
+      estimateSeconds(report, 'master') > estimateSeconds(report, 'remux') * 10,
+      'a re-encode should be estimated as far more expensive',
+    );
+  });
+});
