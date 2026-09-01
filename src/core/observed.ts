@@ -5,8 +5,7 @@
  *
  * A reverse-engineered copy of what the Haze Engine 4.0 does to an MP4, derived by
  * comparing a real input against its real output byte for byte, not from documentation.
- * Every constant here was measured, and the tests assert the output matches the reference
- * file's structure.
+ * Every constant here was measured against the observed output.
  *
  * WHAT IT DOES
  *
@@ -46,7 +45,6 @@ import {
   parseBoxes,
   readBox,
   readMdhdDuration,
-  readMvhdNextTrackId,
   Reader,
   readStsc,
   readStsz,
@@ -78,28 +76,42 @@ const PAD_MULTIPLIER = 9;
 /** Duration assigned to each artificial sample, in the track's media timescale. */
 const ARTIFICIAL_SAMPLE_DURATION = 1;
 
-/** Padding boxes that are dropped, matching the reference output. */
+/** Padding boxes that are accepted on input but dropped from the observed output. */
 const DROPPABLE = new Set(['free', 'skip', 'wide']);
 const KNOWN_TOP_LEVEL = new Set(['ftyp', 'moov', 'mdat', ...DROPPABLE]);
 
 /** Layout passes before giving up. Offsets and index size depend on each other. */
 const MAX_LAYOUT_PASSES = 6;
+const MAX_U32 = 0xffffffff;
+const MAX_TRAILER_SIZE = 2 * 1024 * 1024 * 1024;
+/** Conservative peak budget for the tail, expanded stsz and temporary JS arrays. */
+const MAX_OBSERVED_WORKING_SET = 256 * 1024 * 1024;
+/** Approximate per-entry overhead while writeStsz builds number and Uint8Array lists. */
+const STSZ_REWRITE_BYTES_PER_SAMPLE = 80;
+const COPYRIGHT_TOO = '\\xa9too';
+const DEFAULT_ENCODER_TAG = 'Haze Quality Method https://hazemethod.xyz';
 
 export class ObservedTransformError extends Error {
   override readonly name = 'ObservedTransformError';
 }
 
+function estimateObservedWorkingSet(sourceSamples: number): number {
+  const artificialSamples = sourceSamples * PAD_MULTIPLIER;
+  const outputSamples = sourceSamples + artificialSamples;
+  const trailerBytes = artificialSamples * ARTIFICIAL_SAMPLE.length;
+  const expandedStszBytes = 12 + outputSamples * 4;
+  // The table exists as source/clone/serialized bytes while writeStsz also holds arrays.
+  return trailerBytes + expandedStszBytes * 3 + outputSamples * STSZ_REWRITE_BYTES_PER_SAMPLE;
+}
+
 export interface ObservedSupport {
   readonly supported: boolean;
   readonly reason: string;
-  /**
-   * True when the file is otherwise suitable but its audio is not AAC. The transformation
-   * clones an AAC track, so a different codec needs converting first.
-   */
+  /** True only when one otherwise usable audio track merely needs conversion to AAC. */
   readonly needsAacPreparation: boolean;
 }
 
-/** Whether the exact replication can be applied to this file. */
+/** Whether the observed transform's measured input domain applies to this file. */
 export function canApplyObserved(report: MediaReport): ObservedSupport {
   const no = (reason: string, needsAacPreparation = false): ObservedSupport => ({
     supported: false,
@@ -109,26 +121,66 @@ export function canApplyObserved(report: MediaReport): ObservedSupport {
 
   if (report.fragmented) return no('the file is fragmented');
 
-  const types = report.topLevel.map((b) => b.type);
-  const unknown = types.filter((t) => !KNOWN_TOP_LEVEL.has(t));
+  const types = report.topLevel.map((box) => box.type);
+  const unknown = types.filter((type) => !KNOWN_TOP_LEVEL.has(type));
   if (unknown.length > 0) {
     return no(`unexpected top-level box(es): ${[...new Set(unknown)].join(', ')}`);
   }
-  if (types.filter((t) => t === 'mdat').length !== 1) {
-    return no('the media is not in a single mdat box');
+
+  for (const required of ['ftyp', 'moov', 'mdat'] as const) {
+    const count = types.filter((type) => type === required).length;
+    if (count !== 1) return no(`the file needs exactly one ${required} box; found ${count}`);
   }
-  if (!types.includes('ftyp') || !types.includes('moov')) {
-    return no('the file is missing an ftyp or moov box');
+
+  const lastBox = report.topLevel.at(-1);
+  if (!lastBox || lastBox.end !== report.fileSize) {
+    return no('the source already contains bytes outside its declared top-level boxes');
   }
   if (!report.video) return no('there is no video track');
 
-  const audioTracks = report.tracks.filter((t) => t.kind === 'audio');
-  if (audioTracks.length === 0) {
-    return no('there is no audio track to clone', true);
+  if (report.tracks.some((track) => track.chunkOffsetBox === 'co64')) {
+    return no('every chunk-offset table must use the observed 32-bit stco form');
   }
-  if (!audioTracks.some((t) => t.format === 'mp4a')) {
-    const found = audioTracks.map((t) => t.codecLabel).join(', ');
-    return no(`the audio is ${found}, not AAC, so the exact replication does not apply`, true);
+  const maxTrackId = Math.max(0, ...report.tracks.map((track) => track.id));
+  if (maxTrackId >= MAX_U32 - 1) {
+    return no('there is no room for both a cloned track_ID and the next_track_ID counter');
+  }
+
+  const audioTracks = report.tracks.filter((track) => track.kind === 'audio');
+  if (audioTracks.length === 0) {
+    return no('there is no AAC audio track to clone', true);
+  }
+  if (audioTracks.length > 1) {
+    return no(`the transform requires exactly one AAC audio track; found ${audioTracks.length}`);
+  }
+
+  const audio = audioTracks[0]!;
+  if (audio.format !== 'mp4a') {
+    return no(
+      `the audio is ${audio.codecLabel}, not AAC, so the exact replication does not apply`,
+      true,
+    );
+  }
+  if (audio.sampleEntryCount !== 1) {
+    return no('the AAC track must contain exactly one sample description');
+  }
+  if (audio.chunkOffsetBox !== 'stco') {
+    return no('the AAC track must use a 32-bit stco chunk-offset table');
+  }
+  if (audio.sampleCount <= 0 || audio.chunkCount <= 0) {
+    return no('the AAC sample or chunk table is empty');
+  }
+  const artificialSamples = audio.sampleCount * PAD_MULTIPLIER;
+  const trailerBytes = artificialSamples * ARTIFICIAL_SAMPLE.length;
+  if (
+    !Number.isSafeInteger(artificialSamples) ||
+    audio.sampleCount + artificialSamples > MAX_U32 ||
+    trailerBytes > MAX_TRAILER_SIZE
+  ) {
+    return no('the artificial sample table or trailer exceeds the supported size');
+  }
+  if (estimateObservedWorkingSet(audio.sampleCount) > MAX_OBSERVED_WORKING_SET) {
+    return no('the observed table expansion would exceed the browser memory budget');
   }
 
   return { supported: true, reason: '', needsAacPreparation: false };
@@ -160,27 +212,43 @@ export interface ObservedResult {
 
 export interface ObservedOptions {
   /**
-   * Encoder tag written into `udta/meta/ilst/©too`.
-   *
-   * Defaults to this project's own name. The reference output writes the originating
-   * tool's name there; copying that string would misattribute the file, and nothing
-   * suggests the tag affects how the transformation is received.
+   * Encoder tag used when the source already contains an `ilst` metadata container.
+   * The measured Haze 4.0 value is the default; no metadata hierarchy is invented when
+   * the source has none.
    */
   readonly encoderTag?: string;
 }
-
-const DEFAULT_ENCODER_TAG = 'Observed transform (spec-noncompliant)';
 
 export async function applyObservedTransform(
   file: File,
   options: ObservedOptions = {},
 ): Promise<ObservedResult> {
   const entries = await scanTopLevel(file);
-  const ftypEntry = entries.find((e) => e.type === 'ftyp');
-  const moovEntry = entries.find((e) => e.type === 'moov');
-  const mdatEntry = entries.find((e) => e.type === 'mdat');
-  if (!ftypEntry || !moovEntry || !mdatEntry) {
-    throw new ObservedTransformError('This file needs an ftyp, a moov and an mdat box.');
+  const types = entries.map((entry) => entry.type);
+  const unknown = types.filter((type) => !KNOWN_TOP_LEVEL.has(type));
+  if (unknown.length > 0) {
+    throw new ObservedTransformError(
+      `Unexpected top-level box(es): ${[...new Set(unknown)].join(', ')}.`,
+    );
+  }
+
+  const exactlyOne = (type: 'ftyp' | 'moov' | 'mdat') => {
+    const matches = entries.filter((entry) => entry.type === type);
+    if (matches.length !== 1) {
+      throw new ObservedTransformError(
+        `This transform requires exactly one ${type} box; found ${matches.length}.`,
+      );
+    }
+    return matches[0]!;
+  };
+
+  const ftypEntry = exactlyOne('ftyp');
+  const moovEntry = exactlyOne('moov');
+  const mdatEntry = exactlyOne('mdat');
+  if (entries.at(-1)?.end !== file.size) {
+    throw new ObservedTransformError(
+      'The source contains trailing bytes outside its declared top-level boxes.',
+    );
   }
 
   const ftypBytes = await readBox(file, ftypEntry);
@@ -199,27 +267,37 @@ export async function applyObservedTransform(
     }),
   });
 
-  const dropped = entries.filter((e) => DROPPABLE.has(e.type)).map((e) => e.type);
+  if (mutableFindAll(moov, 'co64').length > 0) {
+    throw new ObservedTransformError('Observed Haze 4.0 requires stco and does not accept co64.');
+  }
+  for (const table of allChunkOffsetTables(moov)) {
+    if (table.kind !== 'stco') {
+      throw new ObservedTransformError('Observed Haze 4.0 requires 32-bit stco tables.');
+    }
+    requireExactTable(table.box, 4, 'stco');
+  }
 
-  // Step 3: strip edit lists from the original tracks.
+  const dropped = entries.filter((entry) => DROPPABLE.has(entry.type)).map((entry) => entry.type);
+
+  // Strip edit lists from every original track before cloning the AAC track.
   const editListsRemoved = removeEditLists(moov);
-
-  // Steps 5 and 6: clone the AAC track and extend it.
   const clone = cloneAacTrack(moov);
 
-  // Step 12: identify the file.
+  // Match the observed metadata behavior: edit an existing ilst, but never create one.
   writeEncoderTag(moov, options.encoderTag ?? DEFAULT_ENCODER_TAG);
 
   const sourceDataStart = mdatEntry.start + mdatEntry.headerSize;
   const dataLength = mdatEntry.size - mdatEntry.headerSize;
   const artificialBytes = clone.artificialSamples * ARTIFICIAL_SAMPLE.length;
+  if (!Number.isSafeInteger(artificialBytes) || artificialBytes > MAX_TRAILER_SIZE) {
+    throw new ObservedTransformError('The artificial trailer exceeds the 2 GiB safety limit.');
+  }
 
   // Every real chunk offset shifts by the same delta; the clone's final chunk points past
-  // the end of mdat, at the artificial tail. Both depend on the index size, which changes
-  // as offsets are written, so solve for a fixed point.
+  // the end of mdat. Both depend on the index size, so solve for a fixed point.
   const tables = allChunkOffsetTables(moov);
-  const sourceOffsets = tables.map((t) => [...t.offsets]);
-  const cloneTableIndex = tables.findIndex((t) => t.box === clone.stcoBox);
+  const sourceOffsets = tables.map((table) => [...table.offsets]);
+  const cloneTableIndex = tables.findIndex((table) => table.box === clone.stcoBox);
   if (cloneTableIndex < 0) {
     throw new ObservedTransformError('Lost track of the cloned chunk offset table.');
   }
@@ -232,14 +310,18 @@ export async function applyObservedTransform(
     const indexSize = measure(moov);
     const newDataStart = ftypBytes.length + indexSize + mdatEntry.headerSize;
     const nextDelta = newDataStart - sourceDataStart;
-    // Step 11: the artificial chunk sits immediately after the mdat box ends.
     const artificialStart = newDataStart + dataLength;
 
     for (const [index, table] of tables.entries()) {
       const shifted = sourceOffsets[index]!.map((offset) => offset + nextDelta);
       if (index === cloneTableIndex) {
-        // The last entry was appended by the clone and is a placeholder until now.
+        // The final entry was appended as a placeholder by cloneAacTrack.
         shifted[shifted.length - 1] = artificialStart;
+      }
+      if (shifted.some((offset) => offset < 0 || offset > MAX_U32)) {
+        throw new ObservedTransformError(
+          'A relocated chunk offset no longer fits the observed 32-bit stco layout.',
+        );
       }
       writeChunkOffsets(table, shifted);
     }
@@ -265,13 +347,11 @@ export async function applyObservedTransform(
     tail.set(ARTIFICIAL_SAMPLE, at);
   }
 
-  // The media payload is referenced as a slice of the source file, so the video and audio
-  // bytes are copied verbatim without ever entering memory. That is what preserves the
-  // elementary stream exactly.
-  const payload = file.slice(mdatEntry.start, mdatEntry.end);
+  // Include the complete original mdat box (header and payload) without loading it into JS.
+  const mdat = file.slice(mdatEntry.start, mdatEntry.end);
 
   return {
-    blob: new Blob([ftypBytes, finalIndex, payload, tail], { type: 'video/mp4' }),
+    blob: new Blob([ftypBytes, finalIndex, mdat, tail], { type: 'video/mp4' }),
     classification: 'OBSERVED',
     isoCompliant: false,
     validationStatus: 'NOT APPROVED',
@@ -309,22 +389,53 @@ interface CloneResult {
   readonly stcoBox: MutableBox;
 }
 
-/**
- * Deep-copies the AAC track, gives it a new id, and appends the artificial samples.
- */
+/** Deep-copies the sole AAC track, gives it max(track_ID)+1, and extends its tables. */
 function cloneAacTrack(moov: MutableBox): CloneResult {
-  const traks = (moov.children ?? []).filter((c) => c.type === 'trak');
-  const source = traks.find((trak) => isAacTrack(trak));
-  if (!source) {
-    throw new ObservedTransformError('No AAC audio track to clone.');
+  const traks = (moov.children ?? []).filter((child) => child.type === 'trak');
+  if (!traks.some((trak) => isVideoTrack(trak))) {
+    throw new ObservedTransformError('Observed Haze 4.0 requires a video track.');
   }
 
+  const audioTracks = traks.filter((trak) => isAudioTrack(trak));
+  if (audioTracks.length !== 1) {
+    throw new ObservedTransformError(
+      `Observed Haze 4.0 requires exactly one AAC audio track; found ${audioTracks.length}.`,
+    );
+  }
+
+  const source = audioTracks[0]!;
+  if (!isAacTrack(source)) {
+    throw new ObservedTransformError('The sole audio track is not AAC/mp4a.');
+  }
+
+  // Enforce count and resource limits before readStsz or writeStsz allocate large arrays.
+  const sourceSamples = readObservedSourceSampleCount(source);
+  const artificialSamples = sourceSamples * PAD_MULTIPLIER;
+
+  // The current reference first normalises the original AAC timing and declared maximum
+  // bitrate, then clones that already-normalised track.
+  normalizeObservedAacTrack(source);
   const clone = deepCopy(source);
 
-  // Step 6: a fresh track_ID, and mvhd's counter moves on.
   const mvhd = mutableChild(moov, 'mvhd');
   if (!mvhd?.payload) throw new ObservedTransformError('The moov box has no mvhd.');
-  const trackId = readMvhdNextTrackId(mvhd.payload);
+
+  const trackIds = mutableFindAll(moov, 'tkhd').map((tkhd) => {
+    if (!tkhd.payload) throw new ObservedTransformError('A track has no readable tkhd payload.');
+    const position = tkhd.payload[0] === 1 ? 20 : 12;
+    if (tkhd.payload.length < position + 4) {
+      throw new ObservedTransformError('A tkhd box is too short to contain track_ID.');
+    }
+    return readTkhdTrackId(tkhd.payload);
+  });
+  const maxTrackId = Math.max(0, ...trackIds);
+  if (maxTrackId >= MAX_U32 - 1) {
+    throw new ObservedTransformError(
+      'No 32-bit values remain for both the cloned track_ID and mvhd.next_track_ID.',
+    );
+  }
+  const trackId = maxTrackId + 1;
+
   const cloneTkhd = mutableChild(clone, 'tkhd');
   if (!cloneTkhd?.payload) throw new ObservedTransformError('The cloned track has no tkhd.');
   writeTkhdTrackId(cloneTkhd, trackId);
@@ -332,34 +443,54 @@ function cloneAacTrack(moov: MutableBox): CloneResult {
 
   const stbl = mutableChild(mutableChild(mutableChild(clone, 'mdia'), 'minf'), 'stbl');
   if (!stbl) throw new ObservedTransformError('The cloned track has no sample table.');
+  if (mutableFindAll(clone, 'stsz').length !== 1 || mutableFindAll(clone, 'stco').length !== 1) {
+    throw new ObservedTransformError('The AAC track must contain exactly one stsz and one stco.');
+  }
+  if (mutableFindAll(clone, 'co64').length > 0) {
+    throw new ObservedTransformError('The AAC track uses co64 instead of the observed stco form.');
+  }
 
   const stts = readStts(stbl);
   const stsz = readStsz(stbl);
   const stsc = readStsc(stbl);
   const stco = allChunkOffsetTables(clone)[0];
-  if (!stts || !stsz || !stsc || !stco) {
-    throw new ObservedTransformError('The AAC track is missing part of its sample table.');
+  if (!stts || !stsz || !stsc || !stco || stco.kind !== 'stco') {
+    throw new ObservedTransformError('The AAC track is missing part of its observed sample table.');
   }
 
-  const sourceSamples = stsz.sizes.length;
-  if (sourceSamples === 0) {
-    throw new ObservedTransformError('The AAC track declares no samples.');
-  }
-  const artificialSamples = sourceSamples * PAD_MULTIPLIER;
+  requireExactTable(stts.box, 8, 'stts');
+  requireExactTable(stsc.box, 12, 'stsc');
+  requireExactTable(stco.box, 4, 'stco');
 
-  // Step 9: every table grows consistently.
+  const stszPayload = stsz.box.payload;
+  if (!stszPayload || stszPayload.length < 12) {
+    throw new ObservedTransformError('The AAC stsz table is truncated.');
+  }
+  const uniformSize = readUint32(stszPayload, 4);
+  const declaredSamples = readUint32(stszPayload, 8);
+  if (uniformSize !== 0 || stsz.wasUniform) {
+    throw new ObservedTransformError('The observed transform requires a variable-size AAC stsz table.');
+  }
+  if (stszPayload.length !== 12 + declaredSamples * 4 || stsz.sizes.length !== declaredSamples) {
+    throw new ObservedTransformError('The AAC stsz table is padded or truncated.');
+  }
+
+  if (declaredSamples !== sourceSamples) {
+    throw new ObservedTransformError('The AAC sample count changed during preparation.');
+  }
+  const chunkCount = stco.offsets.length;
+  if (sourceSamples <= 0 || chunkCount <= 0) {
+    throw new ObservedTransformError('The AAC sample or chunk table is empty.');
+  }
+
   writeStts(stts.box, [
     ...stts.entries,
     { count: artificialSamples, delta: ARTIFICIAL_SAMPLE_DURATION },
   ]);
-
   writeStsz(stsz.box, [
     ...stsz.sizes,
     ...new Array<number>(artificialSamples).fill(ARTIFICIAL_SAMPLE.length),
   ]);
-
-  // Step 10: one new chunk holding all of them. Chunk indices are 1-based.
-  const chunkCount = stco.offsets.length;
   writeStsc(stsc.box, [
     ...stsc.entries,
     {
@@ -368,94 +499,324 @@ function cloneAacTrack(moov: MutableBox): CloneResult {
       sampleDescriptionIndex: 1,
     },
   ]);
-
-  // One chunk is genuinely being added here, so the length guard is waived explicitly.
-  // The offset is a placeholder; the layout pass fills it in once the tail position is
-  // known, which cannot happen until the index has its final size.
   writeChunkOffsets(stco, [...stco.offsets, 0], { allowCountChange: true });
 
-  // Step 9: the media duration grows by one tick per artificial sample.
   const mdhd = mutableChild(mutableChild(clone, 'mdia'), 'mdhd');
   if (!mdhd?.payload) throw new ObservedTransformError('The cloned track has no mdhd.');
   const { duration } = readMdhdDuration(mdhd.payload);
   writeMdhdDuration(mdhd, duration + artificialSamples * ARTIFICIAL_SAMPLE_DURATION);
 
-  // Inserted directly after the track it was copied from, matching the reference output.
+  // The observed writer appends the clone after the complete direct trak block.
   const children = moov.children!;
-  children.splice(children.indexOf(source) + 1, 0, clone);
+  let lastTrackIndex = -1;
+  for (let index = 0; index < children.length; index++) {
+    if (children[index]!.type === 'trak') lastTrackIndex = index;
+  }
+  if (lastTrackIndex < 0) throw new ObservedTransformError('The moov box contains no tracks.');
+  children.splice(lastTrackIndex + 1, 0, clone);
 
-  // Re-read so the returned handle refers to the table now attached to the tree.
   const attached = allChunkOffsetTables(clone)[0];
-  if (!attached) throw new ObservedTransformError('The clone lost its chunk offset table.');
+  if (!attached || attached.kind !== 'stco') {
+    throw new ObservedTransformError('The clone lost its stco chunk offset table.');
+  }
 
   return { trackId, sourceSamples, artificialSamples, stcoBox: attached.box };
 }
 
-function isAacTrack(trak: MutableBox): boolean {
-  const mdia = mutableChild(trak, 'mdia');
-  const hdlr = mutableChild(mdia, 'hdlr')?.payload;
-  if (!hdlr || hdlr.length < 12) return false;
-  const handler = String.fromCharCode(hdlr[8]!, hdlr[9]!, hdlr[10]!, hdlr[11]!);
-  if (handler !== 'soun') return false;
+function trackHandler(trak: MutableBox): string | null {
+  const hdlr = mutableChild(mutableChild(trak, 'mdia'), 'hdlr')?.payload;
+  if (!hdlr || hdlr.length < 12) return null;
+  return String.fromCharCode(hdlr[8]!, hdlr[9]!, hdlr[10]!, hdlr[11]!);
+}
 
-  const stsd = mutableChild(mutableChild(mutableChild(mdia, 'minf'), 'stbl'), 'stsd')?.payload;
+function isVideoTrack(trak: MutableBox): boolean {
+  return trackHandler(trak) === 'vide';
+}
+
+function isAudioTrack(trak: MutableBox): boolean {
+  return trackHandler(trak) === 'soun';
+}
+
+function isAacTrack(trak: MutableBox): boolean {
+  if (!isAudioTrack(trak)) return false;
+  const stsd = mutableChild(
+    mutableChild(mutableChild(mutableChild(trak, 'mdia'), 'minf'), 'stbl'),
+    'stsd',
+  )?.payload;
   if (!stsd || stsd.length < 16) return false;
-  // version/flags(4) entry_count(4) then size(4) format(4)
+  // version/flags(4), entry_count(4), sample-entry size(4), format(4)
   return String.fromCharCode(stsd[12]!, stsd[13]!, stsd[14]!, stsd[15]!) === 'mp4a';
+}
+
+/** Reads the raw stsz count and rejects unsafe expansion before allocating sample arrays. */
+function readObservedSourceSampleCount(trak: MutableBox): number {
+  const stbl = mutableChild(mutableChild(mutableChild(trak, 'mdia'), 'minf'), 'stbl');
+  const stszBoxes = mutableFindAll(trak, 'stsz');
+  const stsd = mutableChild(stbl, 'stsd');
+  if (!stbl || stszBoxes.length !== 1 || !stszBoxes[0]?.payload || !stsd?.payload) {
+    throw new ObservedTransformError('The AAC track must contain one readable stsz and stsd.');
+  }
+
+  const stsdEntryCount = stsd.payload.length >= 8 ? readUint32(stsd.payload, 4) : 0;
+  if (stsdEntryCount !== 1) {
+    throw new ObservedTransformError('The AAC track must contain exactly one sample description.');
+  }
+
+  const payload = stszBoxes[0].payload;
+  if (payload.length < 12) throw new ObservedTransformError('The AAC stsz table is truncated.');
+  const uniformSize = readUint32(payload, 4);
+  const sampleCount = readUint32(payload, 8);
+  if (uniformSize !== 0) {
+    throw new ObservedTransformError('The observed transform requires a variable-size AAC stsz table.');
+  }
+  if (sampleCount <= 0 || payload.length !== 12 + sampleCount * 4) {
+    throw new ObservedTransformError('The AAC stsz table is empty, padded or truncated.');
+  }
+
+  const artificialSamples = sampleCount * PAD_MULTIPLIER;
+  const trailerBytes = artificialSamples * ARTIFICIAL_SAMPLE.length;
+  if (
+    !Number.isSafeInteger(artificialSamples) ||
+    sampleCount + artificialSamples > MAX_U32 ||
+    trailerBytes > MAX_TRAILER_SIZE
+  ) {
+    throw new ObservedTransformError('The artificial sample table or trailer exceeds the supported size.');
+  }
+  if (estimateObservedWorkingSet(sampleCount) > MAX_OBSERVED_WORKING_SET) {
+    throw new ObservedTransformError(
+      'The observed table expansion would exceed the browser memory budget.',
+    );
+  }
+  return sampleCount;
+}
+
+/**
+ * Matches the AAC normalisation present in the current real reference output.
+ *
+ * `mdhd.duration` is brought in line with the complete decoding timeline in `stts`.
+ * The maximum bitrate fields in both `esds` and `btrt` are replaced by the encoded
+ * payload bitrate calculated from the source duration. Average bitrate is preserved.
+ */
+function normalizeObservedAacTrack(trak: MutableBox): void {
+  const mdia = mutableChild(trak, 'mdia');
+  const mdhd = mutableChild(mdia, 'mdhd');
+  const stbl = mutableChild(mutableChild(mdia, 'minf'), 'stbl');
+  if (!mdhd?.payload || !stbl) {
+    throw new ObservedTransformError('The AAC track is missing mdhd or stbl.');
+  }
+
+  const stts = readStts(stbl);
+  const stsz = readStsz(stbl);
+  const stsd = mutableChild(stbl, 'stsd');
+  if (!stts || !stsz || !stsd?.payload) {
+    throw new ObservedTransformError('The AAC track is missing stts, stsz or stsd.');
+  }
+  requireExactTable(stts.box, 8, 'stts');
+
+  const stszPayload = stsz.box.payload;
+  if (!stszPayload || stszPayload.length < 12) {
+    throw new ObservedTransformError('The AAC stsz table is truncated.');
+  }
+  const uniformSize = readUint32(stszPayload, 4);
+  const declaredSamples = readUint32(stszPayload, 8);
+  if (uniformSize !== 0 || stsz.wasUniform) {
+    throw new ObservedTransformError('The observed transform requires a variable-size AAC stsz table.');
+  }
+  if (stszPayload.length !== 12 + declaredSamples * 4 || stsz.sizes.length !== declaredSamples) {
+    throw new ObservedTransformError('The AAC stsz table is padded or truncated.');
+  }
+
+  const timelineTicks = stts.entries.reduce(
+    (sum, entry) => sum + BigInt(entry.count) * BigInt(entry.delta),
+    0n,
+  );
+  if (timelineTicks <= 0n || timelineTicks > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ObservedTransformError('The AAC decoding timeline is empty or too large.');
+  }
+
+  const { duration, timescale } = readMdhdDuration(mdhd.payload);
+  if (duration <= 0 || timescale <= 0) {
+    throw new ObservedTransformError('The AAC mdhd duration or timescale is invalid.');
+  }
+
+  const payloadBits = stsz.sizes.reduce((sum, size) => sum + BigInt(size) * 8n, 0n);
+  const maximumBitrate = (payloadBits * BigInt(timescale)) / BigInt(duration);
+  if (maximumBitrate < 0n || maximumBitrate > BigInt(MAX_U32)) {
+    throw new ObservedTransformError('The derived AAC maximum bitrate does not fit 32 bits.');
+  }
+
+  patchAacMaximumBitrate(stsd, Number(maximumBitrate));
+  writeMdhdDuration(mdhd, Number(timelineTicks));
+}
+
+/** Updates maxBitrate in the first mp4a entry's esds and btrt sub-boxes. */
+function patchAacMaximumBitrate(stsd: MutableBox, maximumBitrate: number): void {
+  const source = stsd.payload;
+  if (!source || source.length < 24) {
+    throw new ObservedTransformError('The AAC stsd payload is truncated.');
+  }
+  const payload = new Uint8Array(source);
+  const entryCount = readUint32(payload, 4);
+  if (entryCount !== 1) {
+    throw new ObservedTransformError('The AAC stsd must contain exactly one sample entry.');
+  }
+
+  const entryStart = 8;
+  const entrySize = readUint32(payload, entryStart);
+  const entryEnd = entryStart + entrySize;
+  if (entrySize < 36 || entryEnd > payload.length) {
+    throw new ObservedTransformError('The AAC sample entry is truncated.');
+  }
+  const format = String.fromCharCode(
+    payload[entryStart + 4]!,
+    payload[entryStart + 5]!,
+    payload[entryStart + 6]!,
+    payload[entryStart + 7]!,
+  );
+  if (format !== 'mp4a') throw new ObservedTransformError('The audio sample entry is not mp4a.');
+
+  let at = entryStart + 16; // sample-entry header + reserved/data_reference_index
+  const quickTimeVersion = readUint16(payload, at);
+  at += 20; // version/revision/vendor/channels/sample size/compression/packet/rate
+  if (quickTimeVersion === 1) at += 16;
+  else if (quickTimeVersion === 2) at += 36;
+  if (at > entryEnd) throw new ObservedTransformError('The mp4a fixed header is truncated.');
+
+  while (at + 8 <= entryEnd) {
+    const size = readUint32(payload, at);
+    if (size < 8 || at + size > entryEnd) {
+      throw new ObservedTransformError('A sub-box in the mp4a sample entry is malformed.');
+    }
+    const type = String.fromCharCode(payload[at + 4]!, payload[at + 5]!, payload[at + 6]!, payload[at + 7]!);
+    const bodyStart = at + 8;
+    const bodyEnd = at + size;
+    if (type === 'esds') patchEsdsMaximumBitrate(payload, bodyStart, bodyEnd, maximumBitrate);
+    if (type === 'btrt' && bodyEnd - bodyStart >= 12) {
+      writeUint32(payload, bodyStart + 4, maximumBitrate);
+    }
+    at += size;
+  }
+
+  stsd.payload = payload;
+}
+
+function patchEsdsMaximumBitrate(
+  payload: Uint8Array,
+  start: number,
+  end: number,
+  maximumBitrate: number,
+): void {
+  let at = start;
+  if (end - at < 4) return;
+  at += 4; // FullBox version/flags
+  if (at >= end || payload[at++] !== 0x03) return; // ES_Descriptor
+
+  const esLength = readDescriptorLength(payload, at, end);
+  if (!esLength) return;
+  at = esLength.next;
+  if (at + 3 > end) return;
+  at += 2; // ES_ID
+  const flags = payload[at++]!;
+  if (flags & 0x80) at += 2;
+  if (flags & 0x40) {
+    if (at >= end) return;
+    at += 1 + payload[at]!;
+  }
+  if (flags & 0x20) at += 2;
+  if (at >= end || payload[at++] !== 0x04) return; // DecoderConfigDescriptor
+
+  const configLength = readDescriptorLength(payload, at, end);
+  if (!configLength) return;
+  at = configLength.next;
+  // objectTypeIndication(1), streamType/upStream(1), bufferSizeDB(3), maxBitrate(4)
+  if (at + 9 > end) return;
+  at += 5;
+  writeUint32(payload, at, maximumBitrate);
+}
+
+function readDescriptorLength(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): { length: number; next: number } | null {
+  let length = 0;
+  let at = start;
+  for (let index = 0; index < 4; index++) {
+    if (at >= end) return null;
+    const byte = bytes[at++]!;
+    length = (length << 7) | (byte & 0x7f);
+    if ((byte & 0x80) === 0) return { length, next: at };
+  }
+  return null;
+}
+
+function readUint16(bytes: Uint8Array, at: number): number {
+  return (bytes[at]! << 8) | bytes[at + 1]!;
+}
+
+function writeUint32(bytes: Uint8Array, at: number, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_U32 || at < 0 || at + 4 > bytes.length) {
+    throw new ObservedTransformError(`Cannot write 32-bit value ${value} at byte ${at}.`);
+  }
+  bytes[at] = (value >>> 24) & 0xff;
+  bytes[at + 1] = (value >>> 16) & 0xff;
+  bytes[at + 2] = (value >>> 8) & 0xff;
+  bytes[at + 3] = value & 0xff;
 }
 
 function deepCopy(box: MutableBox): MutableBox {
   return {
     type: box.type,
-    // Payloads are copied rather than shared: the clone's tables are rewritten, and a
-    // shared view would edit the original track too.
     payload: box.payload ? new Uint8Array(box.payload) : null,
     prefix: box.prefix ? new Uint8Array(box.prefix) : null,
     children: box.children ? box.children.map(deepCopy) : null,
   };
 }
 
-/** Writes `udta/meta/ilst/©too`, creating the chain if absent. */
+/**
+ * Replaces or appends `©too` in every existing ilst, preserving every sibling and all
+ * metadata hierarchy. If no ilst exists, the source is left untouched, matching the
+ * measured writer rather than inventing `udta/meta/ilst`.
+ */
 function writeEncoderTag(moov: MutableBox, tag: string): void {
-  const text = new TextEncoder().encode(tag);
-  // data box: version/flags(4) reserved(4) then UTF-8 text. Type 1 means text.
-  const data: MutableBox = {
-    type: 'data',
-    payload: concatBytes([new Uint8Array([0, 0, 0, 1]), new Uint8Array(4), text]),
-    prefix: null,
-    children: null,
-  };
-  // The tag name begins with the 0xA9 copyright byte, which the reader renders escaped.
-  const tooBox: MutableBox = { type: '\\xa9too', payload: null, prefix: null, children: [data] };
-  const ilst: MutableBox = { type: 'ilst', payload: null, prefix: null, children: [tooBox] };
-  const hdlr: MutableBox = {
-    type: 'hdlr',
-    payload: concatBytes([
-      new Uint8Array(4), // version/flags
-      new Uint8Array(4), // pre_defined
-      new TextEncoder().encode('mdir'),
-      new TextEncoder().encode('appl'),
-      new Uint8Array(9), // reserved + empty name
-    ]),
-    prefix: null,
-    children: null,
-  };
-  const meta: MutableBox = {
-    type: 'meta',
-    payload: null,
-    // ISO-flavoured meta is a FullBox, so the version/flags word has to be present.
-    prefix: new Uint8Array(4),
-    children: [hdlr, ilst],
+  const makeTag = (): MutableBox => {
+    const text = new TextEncoder().encode(tag);
+    const data: MutableBox = {
+      type: 'data',
+      payload: concatBytes([new Uint8Array([0, 0, 0, 1]), new Uint8Array(4), text]),
+      prefix: null,
+      children: null,
+    };
+    return { type: COPYRIGHT_TOO, payload: null, prefix: null, children: [data] };
   };
 
-  let udta = mutableChild(moov, 'udta');
-  if (!udta) {
-    udta = { type: 'udta', payload: null, prefix: null, children: [] };
-    moov.children!.push(udta);
+  for (const ilst of mutableFindAll(moov, 'ilst')) {
+    ilst.children ??= [];
+    let found = false;
+    ilst.children = ilst.children.map((child) => {
+      if (child.type !== COPYRIGHT_TOO) return child;
+      found = true;
+      return makeTag();
+    });
+    if (!found) ilst.children.push(makeTag());
   }
-  udta.children ??= [];
-  udta.children = udta.children.filter((c) => c.type !== 'meta');
-  udta.children.push(meta);
+}
+
+function requireExactTable(box: MutableBox, entryWidth: number, name: string): void {
+  const payload = box.payload;
+  if (!payload || payload.length < 8) {
+    throw new ObservedTransformError(`The ${name} table is truncated.`);
+  }
+  const count = readUint32(payload, 4);
+  if (payload.length !== 8 + count * entryWidth) {
+    throw new ObservedTransformError(`The ${name} table is padded or truncated.`);
+  }
+}
+
+function readUint32(bytes: Uint8Array, at: number): number {
+  return (
+    ((bytes[at]! << 24) | (bytes[at + 1]! << 16) | (bytes[at + 2]! << 8) | bytes[at + 3]!) >>> 0
+  );
 }
 
 function concatBytes(parts: readonly Uint8Array[]): Uint8Array<ArrayBuffer> {
@@ -470,13 +831,7 @@ function concatBytes(parts: readonly Uint8Array[]): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-/**
- * Checks that real chunks land inside `mdat` and the artificial chunk lands in the tail.
- *
- * Worth being strict about even here: this transformation is already out of spec by
- * design, and an offset error on top of that would produce a file that is broken for
- * ordinary reasons rather than deliberate ones.
- */
+/** Checks that real chunks land inside `mdat` and the artificial chunk in the tail. */
 function verifyOffsets(
   moov: MutableBox,
   clone: CloneResult,

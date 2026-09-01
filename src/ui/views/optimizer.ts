@@ -300,10 +300,15 @@ export function createOptimizer(): View {
 
       job.result = { blob, name, report };
       job.state = 'done';
+      const elapsedText =
+        elapsed < 1000 ? `${elapsed.toFixed(0)} ms` : `${(elapsed / 1000).toFixed(1)} s`;
+      const verification =
+        plan.mode === 'observed'
+          ? 'output structure re-analysed — ISO BMFF COMPLIANT: NO; VALIDATION STATUS: NOT APPROVED.'
+          : 'index at the front, output re-checked and valid.';
       log.write(
-        `${job.file.name}: done in ${elapsed < 1000 ? `${elapsed.toFixed(0)} ms` : `${(elapsed / 1000).toFixed(1)} s`}` +
-          ` — ${fmt.bytes(blob.size)}, index at the front, output re-checked and valid.`,
-        'good',
+        `${job.file.name}: done in ${elapsedText} — ${fmt.bytes(blob.size)}, ${verification}`,
+        plan.mode === 'observed' ? 'warn' : 'good',
       );
     } catch (error) {
       if (signal.aborted) {
@@ -595,7 +600,16 @@ export function createOptimizer(): View {
         ),
       ];
 
-      if (plan.engine === 'native') {
+      if (plan.mode === 'observed') {
+        planDetails.push(
+          el('p', {
+            class: 'muted small',
+            text:
+              'Native binary transform. There is no equivalent ffmpeg command, and the ' +
+              'transcoding engine is not loaded for this mode.',
+          }),
+        );
+      } else if (plan.engine === 'native') {
         planDetails.push(
           el('p', { class: 'plan-args-label', text: 'Equivalent ffmpeg command, for reference:' }),
           el('code', {
