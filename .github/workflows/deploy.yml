@@ -26,6 +26,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # When Pages is configured to build from a branch, GitHub runs its own legacy
+      # builder alongside this workflow. That builder publishes the repository source --
+      # which for a Vite project is an index.html pointing at TypeScript -- and whichever
+      # of the two finishes last wins. The result is a site that works or renders blank
+      # depending on a few seconds of scheduling luck, with both workflows reporting
+      # success. Forcing the build type here makes this workflow the only publisher.
+      - name: Make this workflow the only Pages publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(gh api "repos/${{ github.repository }}/pages" --jq '.build_type' 2>/dev/null || echo none)
+          echo "Pages build_type is currently: $current"
+          if [ "$current" = "workflow" ]; then
+            echo "Already publishing from this workflow."
+          elif gh api -X PUT "repos/${{ github.repository }}/pages" -f build_type=workflow; then
+            echo "Switched Pages to publish from this workflow."
+          else
+            echo "::warning title=Pages source not switched::Could not change the Pages \
+            build type automatically. Set Settings -> Pages -> Source to \"GitHub Actions\", \
+            otherwise the legacy branch builder will keep racing this deployment and the \
+            site will intermittently serve unbuilt source."
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

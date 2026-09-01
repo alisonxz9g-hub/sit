@@ -216,9 +216,17 @@ or every asset request resolves against the domain root and 404s.
 that `actions/configure-pages` reports, boots the result in jsdom to prove it renders, and
 publishes the artifact.
 
-It needs one manual setting: **Settings → Pages → Source → GitHub Actions**. With Source
-left on "Deploy from a branch", Pages serves the repository source and the workflow output
-is ignored.
+**Source must be "GitHub Actions", not a branch.** The workflow sets this itself on each
+run, but it is worth understanding why it matters. With Source left on "Deploy from a
+branch", GitHub runs its own legacy builder *in addition to* this workflow. That builder
+publishes the repository source — for a Vite project, an `index.html` pointing at
+TypeScript — and whichever of the two finishes last wins.
+
+This is a genuinely nasty failure mode: both workflows report success, and the site works
+or renders blank depending on a few seconds of scheduling. It was observed here, with the
+legacy builder finishing seven seconds after the real deployment and overwriting it. If the
+automatic switch ever fails, the workflow logs a warning and you can set it manually under
+Settings → Pages.
 
 `.github/workflows/ci.yml` runs the typecheck, the full test suite (installing ffmpeg for
 the fixtures) and the build on every push and pull request.
