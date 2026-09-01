@@ -111,5 +111,46 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # While Pages is set to build from a branch, GitHub's legacy builder publishes the
+      # repository source for the same commit, and whichever publisher finishes last wins.
+      # Measured on three consecutive pushes, it landed 2 to 7 seconds after this workflow
+      # and overwrote it with unbuilt TypeScript.
+      #
+      # Trying to flip the setting from inside the workflow did not work: the legacy run is
+      # already queued before this job exists. So instead of racing it, wait for it to
+      # finish and publish afterwards. Deterministic, and harmless once the setting is
+      # changed, because then there is nothing to wait for.
+      - name: Wait for the legacy Pages builder, if it is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          deadline=$(( SECONDS + 300 ))
+          waited=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            pending=$(gh api \
+              "repos/${{ github.repository }}/actions/runs?head_sha=$SHA&per_page=30" \
+              --jq '[.workflow_runs[]
+                     | select(.path == "dynamic/pages/pages-build-deployment")
+                     | select(.status != "completed")] | length' 2>/dev/null || echo 0)
+
+            if [ "$pending" = "0" ]; then
+              if [ "$waited" -eq 0 ]; then
+                echo "No legacy Pages build for this commit. Publishing straight away."
+              else
+                echo "Legacy Pages build finished after ${waited}s. Publishing now."
+              fi
+              exit 0
+            fi
+
+            echo "Legacy Pages build still running (${waited}s elapsed); waiting so this deployment lands last."
+            sleep 10
+            waited=$(( waited + 10 ))
+          done
+
+          echo "::warning title=Legacy Pages build did not finish::Publishing anyway. If the \
+          site serves unbuilt source, set Settings -> Pages -> Source to \"GitHub Actions\" \
+          to stop the legacy builder entirely."
+
       - id: deployment
         uses: actions/deploy-pages@v4
