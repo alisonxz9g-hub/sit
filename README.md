@@ -248,3 +248,4 @@ The app code in this repository is yours to do as you like with. Note that its d
 carry their own terms: ffmpeg.wasm ships FFmpeg and libx264, which are LGPL and GPL
 respectively. Distributing a build means distributing GPL-licensed components, so check
 that this fits your intended use.
+
