@@ -15,7 +15,15 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 
-import { analyzeFile, buildPlan, canRemuxNatively, diagnose, remuxNatively } from './.build/core.mjs';
+import {
+  analyzeFile,
+  applyObservedTransform,
+  buildPlan,
+  canApplyObserved,
+  canRemuxNatively,
+  diagnose,
+  remuxNatively,
+} from './.build/core.mjs';
 
 const run = promisify(execFile);
 const fixtureDir = path.join(import.meta.dirname, 'fixtures');
@@ -460,3 +468,180 @@ describe('native remux', () => {
     );
   });
 });
+
+/* -------------------------------------------------------- observed transform --- */
+
+/**
+ * The replicated third-party container trick.
+ *
+ * These tests pin the measured constants and, more importantly, pin the guarantees around
+ * them: the video stream must survive untouched, the mode must never be recommended on its
+ * own, and the output must declare itself non-compliant.
+ */
+describe('observed transform', () => {
+  const withAac = 'portrait-cfr-faststart.mp4';
+
+  it('is never recommended automatically', async () => {
+    for (const name of ['portrait-cfr-faststart.mp4', 'portrait-no-faststart.mp4', 'vfr.mp4']) {
+      const diagnosis = diagnose(await analyzeFile(await loadFixture(name)));
+      assert.notEqual(
+        diagnosis.recommended,
+        'observed',
+        `${name}: a non-compliant transform must be opt-in, never suggested`,
+      );
+    }
+  });
+
+  it('reports its compliance status on the result', async () => {
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    assert.equal(result.classification, 'OBSERVED');
+    assert.equal(result.isoCompliant, false);
+    assert.equal(result.validationStatus, 'NOT APPROVED');
+  });
+
+  it('clones the AAC track with ten times the samples', async () => {
+    const before = await analyzeFile(await loadFixture(withAac));
+    const sourceAudio = before.tracks.filter((t) => t.kind === 'audio');
+    assert.equal(sourceAudio.length, 1, 'fixture should have exactly one audio track');
+
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    const outPath = await writeBlob(result.blob, `observed-${withAac}`);
+    const after = await analyzeFile(
+      new File([await readFile(outPath)], 'observed.mp4', { type: 'video/mp4' }),
+    );
+
+    const audioAfter = after.tracks.filter((t) => t.kind === 'audio');
+    assert.equal(audioAfter.length, 2, 'the audio track should have been cloned');
+    assert.equal(after.tracks.length, before.tracks.length + 1);
+
+    const clone = audioAfter[audioAfter.length - 1];
+    assert.equal(
+      clone.sampleCount,
+      sourceAudio[0].sampleCount * 10,
+      'the clone should carry ten times the samples',
+    );
+    assert.equal(result.artificialSamples, sourceAudio[0].sampleCount * 9);
+    assert.equal(clone.id, result.clonedTrackId, 'the clone should use the reported track_ID');
+    assert.ok(
+      clone.id > Math.max(...before.tracks.map((t) => t.id)),
+      'the clone needs a track_ID no original track uses',
+    );
+  });
+
+  it('writes the artificial tail outside any box', async () => {
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    const bytes = new Uint8Array(await result.blob.arrayBuffer());
+    const outPath = await writeBlob(result.blob, `observed-tail-${withAac}`);
+    const after = await analyzeFile(
+      new File([bytes], 'observed.mp4', { type: 'video/mp4' }),
+    );
+
+    const lastBox = after.topLevel[after.topLevel.length - 1];
+    const trailing = after.fileSize - lastBox.end;
+    assert.equal(trailing, result.artificialBytes, 'the tail should sit past the last box');
+    assert.equal(trailing, result.artificialSamples * 8, 'each artificial sample is 8 bytes');
+
+    // The exact byte pattern, which is what a strict parser misreads as a 4-byte box.
+    const pattern = [0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+    const tailStart = after.fileSize - trailing;
+    for (let i = 0; i < trailing; i++) {
+      assert.equal(
+        bytes[tailStart + i],
+        pattern[i % 8],
+        `tail byte ${i} should be ${pattern[i % 8]}`,
+      );
+    }
+
+    void outPath;
+  });
+
+  it('moves the index to the front and removes edit lists', async () => {
+    const before = await analyzeFile(await loadFixture(withAac));
+    assert.ok(before.video.editList.present, 'fixture should start with an edit list');
+
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    const after = await analyzeFile(
+      new File([await readFile(await writeBlob(result.blob, `observed-edts-${withAac}`))],
+        'observed.mp4', { type: 'video/mp4' }),
+    );
+
+    assert.equal(after.faststart, true, 'moov should precede mdat');
+    assert.ok(result.editListsRemoved > 0, 'at least one edit list should have been removed');
+    assert.ok(
+      after.tracks.every((t) => !t.editList.present),
+      'no track should carry an edit list',
+    );
+  });
+
+  it('leaves the video elementary stream bit-identical', async () => {
+    const source = path.join(fixtureDir, withAac);
+    const before = await analyzeFile(await loadFixture(withAac));
+
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    const outPath = await writeBlob(result.blob, `observed-hash-${withAac}`);
+    const after = await analyzeFile(
+      new File([await readFile(outPath)], 'observed.mp4', { type: 'video/mp4' }),
+    );
+
+    assert.equal(after.video.byteLength, before.video.byteLength, 'video payload size unchanged');
+    assert.equal(after.video.sampleCount, before.video.sampleCount, 'frame count unchanged');
+
+    // The claim the whole transform rests on: no re-encode. Hashing the copied stream is
+    // the only way to show it rather than assert it.
+    const [hashBefore, hashAfter] = await Promise.all([
+      videoStreamHash(source),
+      videoStreamHash(outPath),
+    ]);
+    assert.equal(hashAfter, hashBefore, 'the video stream should be byte-identical');
+  });
+
+  it('still decodes despite being out of spec', async () => {
+    const result = await applyObservedTransform(await loadFixture(withAac));
+    const outPath = await writeBlob(result.blob, `observed-decode-${withAac}`);
+    // Tolerant parsers ignore trailing bytes; this confirms the file remains playable.
+    const { stderr } = await run(
+      'ffmpeg',
+      ['-nostdin', '-hide_banner', '-v', 'error', '-i', outPath, '-f', 'null', '-'],
+      { maxBuffer: 64 * 1024 * 1024 },
+    );
+    assert.equal(stderr.trim(), '', `ffmpeg reported errors: ${stderr.trim()}`);
+  });
+
+  it('declines a file with no AAC audio and says why', async () => {
+    const report = await analyzeFile(await loadFixture('no-audio.mp4'));
+    const support = canApplyObserved(report);
+
+    assert.equal(support.supported, false);
+    assert.equal(support.needsAacPreparation, true, 'the caller should be told AAC is the blocker');
+    assert.match(support.reason, /audio/i);
+
+    const silent = await loadFixture('no-audio.mp4');
+    await assert.rejects(() => applyObservedTransform(silent), /AAC/i);
+  });
+
+  it('exposes the transform through the pipeline as a native, lossless mode', async () => {
+    const report = await analyzeFile(await loadFixture(withAac));
+    const plan = buildPlan(report, 'observed');
+
+    assert.equal(plan.mode, 'observed');
+    assert.equal(plan.engine, 'native', 'no transcoding engine is needed');
+    assert.equal(plan.lossless, true, 'the media is untouched even though the container is not valid');
+    assert.equal(plan.args.length, 0, 'there is no equivalent ffmpeg command');
+    // The step list is what the UI shows before running, so it has to state the problem.
+    assert.ok(
+      plan.steps.some((s) => /outside (the mdat|any box)/i.test(`${s.label} ${s.detail}`)),
+      'the steps must name the non-compliant part',
+    );
+  });
+});
+
+/** Hash of the copied video stream, without decoding, to prove no re-encode happened. */
+async function videoStreamHash(file) {
+  const { stdout } = await run(
+    'ffmpeg',
+    ['-nostdin', '-hide_banner', '-v', 'error', '-i', file,
+      '-map', '0:v:0', '-c', 'copy', '-f', 'hash', '-hash', 'sha256', '-'],
+    { maxBuffer: 128 * 1024 * 1024 },
+  );
+  return stdout.trim();
+}

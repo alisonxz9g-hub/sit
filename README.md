@@ -15,18 +15,34 @@ makes the best of what it was handed.
 
 This tool measures those things and fixes what can be fixed.
 
-## What it deliberately does not do
+## The observed transform
 
-There is a well-known family of tools that works by corrupting the file on purpose:
-cloning the audio track, inflating its sample table roughly tenfold, and appending junk
-bytes outside the declared media area, to confuse the receiving platform's analysis into
-skipping its heaviest compression pass.
+A fourth mode replicates a third-party container trick, reverse-engineered by comparing a
+real input against its real output byte for byte. It clones the AAC track, appends nine
+artificial 8-byte samples per real sample, and writes them **outside the `mdat` box**. That
+last step violates ISO/IEC 14496-12: a strict parser reads `00 00 00 04` as a box size of 4,
+smaller than the mandatory 8-byte header, and errors out.
 
-That is not implemented here. It sometimes works, but it produces a file that is out of
-spec by construction, stops working the moment the other side tightens its parser, and can
-get an upload rejected rather than improved. **Every file this app writes is a valid MP4.**
+So the output carries its status explicitly:
 
-Two related commitments:
+```
+CLASSIFICATION:      OBSERVED
+ISO BMFF COMPLIANT:  NO
+VALIDATION STATUS:   NOT APPROVED
+```
+
+It is opt-in, listed last, never suggested automatically, and the UI states the above before
+you can run it. The video stream is copied verbatim — verified by SHA-256 against the source
+in the test suite — so nothing is re-encoded either way.
+
+It is included because it demonstrably changes how one platform treats an upload, which the
+spec-compliant modes do not. It is not recommended: the whole effect rests on how a specific
+parser reacts to an inflated audio sample table, and can stop working without notice.
+
+Verified against a real reference pair: cloned sample count, artificial tail length, byte
+pattern, track count, faststart and `mdat` contents all match the reference output exactly.
+
+Two commitments that still hold:
 
 - **No invented specifications.** No platform publishes its internal encoding ladder, so
   any tool stating it exactly is guessing. The targets here encode the uncontroversial
@@ -38,11 +54,12 @@ Two related commitments:
 
 ## The three modes
 
-| Mode | What it does | Lossless | Engine | Cost |
-| --- | --- | --- | --- | --- |
-| **Remux** | Rewrites the index and moves it to the front, drops padding boxes | Yes — bit-identical streams | native | ~20 ms |
-| **Retag** | Remux plus Rec.709 colour tags written into the video sample entry | Yes — metadata only | native | ~20 ms |
-| **Re-encode** | Normalises frame timing, resolution, chroma and audio at high bitrate | No | ffmpeg.wasm | Minutes |
+| Mode | What it does | Lossless | Valid MP4 | Engine | Cost |
+| --- | --- | --- | --- | --- | --- |
+| **Remux** | Rewrites the index and moves it to the front, drops padding boxes | Yes | Yes | native | ~20 ms |
+| **Retag** | Remux plus Rec.709 colour tags written into the video sample entry | Yes | Yes | native | ~20 ms |
+| **Re-encode** | Normalises frame timing, resolution, chroma and audio at high bitrate | No | Yes | ffmpeg.wasm | Minutes |
+| **Observed** | Clones the AAC track and appends artificial samples outside `mdat` | Yes | **No** | native | ~250 ms |
 
 The app picks the cheapest mode that resolves what it found, and explains why. You can
 override it, and the exact command is shown before you run anything.

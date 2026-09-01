@@ -202,8 +202,24 @@ export function readChunkOffsets(stbl: MutableBox): ChunkOffsetTable | null {
  * changes where the payload starts, which changes the offsets. Callers must iterate to a
  * fixed point rather than assuming one pass is enough.
  */
-export function writeChunkOffsets(table: ChunkOffsetTable, offsets: readonly number[]): void {
-  if (offsets.length !== table.offsets.length) {
+export interface WriteChunkOffsetsOptions {
+  /**
+   * Permits the table to change length.
+   *
+   * Off by default, and deliberately so. When relocating an index, the chunk count must
+   * not change, and a length mismatch there means a bug that would otherwise produce a
+   * file whose sample tables disagree with each other. Only a caller that is genuinely
+   * adding or removing chunks should set this.
+   */
+  readonly allowCountChange?: boolean;
+}
+
+export function writeChunkOffsets(
+  table: ChunkOffsetTable,
+  offsets: readonly number[],
+  options: WriteChunkOffsetsOptions = {},
+): void {
+  if (!options.allowCountChange && offsets.length !== table.offsets.length) {
     fail(`Refusing to write ${offsets.length} chunk offset(s) over a table of ${table.offsets.length}.`);
   }
 
@@ -265,4 +281,196 @@ function readU64(bytes: Uint8Array, at: number): number {
     fail(`Chunk offset at byte ${at} exceeds the safe integer range.`);
   }
   return Number(value);
+}
+
+/* --------------------------------------------------------- sample tables --- */
+
+/**
+ * Read/write access to the tables inside an `stbl`.
+ *
+ * These exist so a track can be cloned and extended. Every table has to stay consistent
+ * with the others: `stsz` says how many samples there are, `stts` how long each lasts,
+ * `stsc` which chunk each belongs to, and `stco` where each chunk starts. Getting one out
+ * of step with the rest produces a file that parses and then misbehaves in ways that only
+ * show up on playback.
+ */
+
+/** Version and flags word that opens a FullBox, preserved across a rewrite. */
+function fullBoxHead(payload: Uint8Array | null): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(4);
+  if (payload && payload.length >= 4) out.set(payload.subarray(0, 4));
+  return out;
+}
+
+export interface SttsEntry {
+  /** Number of consecutive samples sharing this duration. */
+  count: number;
+  /** Duration of one sample, in the track's media timescale. */
+  delta: number;
+}
+
+export function readStts(stbl: MutableBox): { box: MutableBox; entries: SttsEntry[] } | null {
+  const box = mutableChild(stbl, 'stts');
+  if (!box?.payload || box.payload.length < 8) return null;
+
+  const payload = box.payload;
+  const declared = readU32(payload, 4);
+  const available = Math.floor((payload.length - 8) / 8);
+  const count = Math.min(declared, available);
+
+  const entries: SttsEntry[] = [];
+  for (let i = 0; i < count; i++) {
+    entries.push({ count: readU32(payload, 8 + i * 8), delta: readU32(payload, 12 + i * 8) });
+  }
+  return { box, entries };
+}
+
+export function writeStts(box: MutableBox, entries: readonly SttsEntry[]): void {
+  box.payload = concat([
+    fullBoxHead(box.payload),
+    u32(entries.length),
+    ...entries.flatMap((e) => [u32(e.count), u32(e.delta)]),
+  ]);
+}
+
+export interface StszTable {
+  box: MutableBox;
+  /** One entry per sample. Uniform tables are expanded so callers see one shape. */
+  sizes: number[];
+  /** True when the source stored a single size for every sample. */
+  wasUniform: boolean;
+}
+
+export function readStsz(stbl: MutableBox): StszTable | null {
+  const box = mutableChild(stbl, 'stsz');
+  if (!box?.payload || box.payload.length < 12) return null;
+
+  const payload = box.payload;
+  const uniformSize = readU32(payload, 4);
+  const declared = readU32(payload, 8);
+
+  if (uniformSize > 0) {
+    // Expanding here costs memory but means the caller never has to special-case the
+    // uniform form, which is where sample-table bugs like to hide.
+    return { box, sizes: new Array<number>(declared).fill(uniformSize), wasUniform: true };
+  }
+
+  const available = Math.floor((payload.length - 12) / 4);
+  const count = Math.min(declared, available);
+  const sizes = new Array<number>(count);
+  for (let i = 0; i < count; i++) sizes[i] = readU32(payload, 12 + i * 4);
+  return { box, sizes, wasUniform: false };
+}
+
+/**
+ * Writes sizes back as an explicit table.
+ *
+ * Always the table form, never the uniform form: a track that gains samples of a different
+ * size can no longer be described by one number, and silently keeping the uniform field
+ * would mis-size every appended sample.
+ */
+export function writeStsz(box: MutableBox, sizes: readonly number[]): void {
+  box.payload = concat([
+    fullBoxHead(box.payload),
+    u32(0), // sample_size 0 means "read the table"
+    u32(sizes.length),
+    ...sizes.map((size) => u32(size)),
+  ]);
+}
+
+export interface StscEntry {
+  /** 1-based index of the first chunk that follows this rule. */
+  firstChunk: number;
+  samplesPerChunk: number;
+  sampleDescriptionIndex: number;
+}
+
+export function readStsc(stbl: MutableBox): { box: MutableBox; entries: StscEntry[] } | null {
+  const box = mutableChild(stbl, 'stsc');
+  if (!box?.payload || box.payload.length < 8) return null;
+
+  const payload = box.payload;
+  const declared = readU32(payload, 4);
+  const available = Math.floor((payload.length - 8) / 12);
+  const count = Math.min(declared, available);
+
+  const entries: StscEntry[] = [];
+  for (let i = 0; i < count; i++) {
+    const at = 8 + i * 12;
+    entries.push({
+      firstChunk: readU32(payload, at),
+      samplesPerChunk: readU32(payload, at + 4),
+      sampleDescriptionIndex: readU32(payload, at + 8),
+    });
+  }
+  return { box, entries };
+}
+
+export function writeStsc(box: MutableBox, entries: readonly StscEntry[]): void {
+  box.payload = concat([
+    fullBoxHead(box.payload),
+    u32(entries.length),
+    ...entries.flatMap((e) => [
+      u32(e.firstChunk),
+      u32(e.samplesPerChunk),
+      u32(e.sampleDescriptionIndex),
+    ]),
+  ]);
+}
+
+/* ------------------------------------------------------------ box headers --- */
+
+/**
+ * Reads and writes the duration field of an `mdhd`, which lives at a different offset
+ * depending on the box version.
+ */
+export function readMdhdDuration(payload: Uint8Array): { duration: number; timescale: number } {
+  const version = payload[0]!;
+  if (version === 1) {
+    return { timescale: readU32(payload, 20), duration: readU64(payload, 24) };
+  }
+  return { timescale: readU32(payload, 12), duration: readU32(payload, 16) };
+}
+
+export function writeMdhdDuration(box: MutableBox, duration: number): void {
+  const payload = box.payload;
+  if (!payload) fail('Cannot set a duration on an mdhd with no payload.');
+
+  const copy = new Uint8Array(payload);
+  const version = copy[0]!;
+  if (version === 1) {
+    copy.set(u64(duration), 24);
+  } else {
+    if (duration > MAX_U32) {
+      fail('Duration no longer fits a version-0 mdhd. Rewriting to version 1 is not supported.');
+    }
+    copy.set(u32(duration), 16);
+  }
+  box.payload = copy;
+}
+
+/** Track id, at a version-dependent offset in `tkhd`. */
+export function readTkhdTrackId(payload: Uint8Array): number {
+  return payload[0] === 1 ? readU32(payload, 20) : readU32(payload, 12);
+}
+
+export function writeTkhdTrackId(box: MutableBox, trackId: number): void {
+  const payload = box.payload;
+  if (!payload) fail('Cannot set a track id on a tkhd with no payload.');
+  const copy = new Uint8Array(payload);
+  copy.set(u32(trackId), copy[0] === 1 ? 20 : 12);
+  box.payload = copy;
+}
+
+/** `next_track_ID` is the last four bytes of `mvhd`. */
+export function readMvhdNextTrackId(payload: Uint8Array): number {
+  return readU32(payload, payload.length - 4);
+}
+
+export function writeMvhdNextTrackId(box: MutableBox, nextTrackId: number): void {
+  const payload = box.payload;
+  if (!payload || payload.length < 4) fail('mvhd is too short to hold a next_track_ID.');
+  const copy = new Uint8Array(payload);
+  copy.set(u32(nextTrackId), copy.length - 4);
+  box.payload = copy;
 }

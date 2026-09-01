@@ -26,10 +26,16 @@
 import type { MasterPlan } from './diagnose';
 import { planMaster } from './diagnose';
 import type { MediaReport } from './mp4/index';
+import { canApplyObserved } from './observed';
 import { canRemuxNatively } from './remux';
 import { AUDIO_TARGET } from './targets';
 
-export type PipelineMode = 'remux' | 'retag' | 'master';
+/**
+ * `observed` is the odd one out: a replication of a third-party container trick that
+ * deliberately writes a file outside the ISO BMFF spec. It is never recommended
+ * automatically and always carries its compliance status in the UI. See ./observed.ts.
+ */
+export type PipelineMode = 'remux' | 'retag' | 'master' | 'observed';
 
 /**
  * Which implementation runs the job.
@@ -294,6 +300,56 @@ function buildMaster(report: MediaReport): PipelinePlan {
   };
 }
 
+function buildObserved(report: MediaReport): PipelinePlan {
+  const support = canApplyObserved(report);
+
+  const steps: PipelineStep[] = [
+    {
+      label: 'Rewrite the index and strip edit lists',
+      detail:
+        'The moov index moves to the front with every chunk offset corrected, and edts/elst ' +
+        'boxes are removed from all tracks.',
+    },
+    {
+      label: 'Clone the AAC track under a new track_ID',
+      detail:
+        'The audio track is duplicated and given the next free track_ID, with mvhd\u2019s ' +
+        'next_track_ID advanced to match.',
+    },
+    {
+      label: 'Append nine artificial samples per real sample',
+      detail:
+        'Each is 8 bytes of 00 00 00 04 00 00 00 00 lasting one tick. The clone\u2019s stts, ' +
+        'stsc, stsz, stco and mdhd duration are all extended to stay consistent.',
+    },
+    {
+      label: 'Place those bytes outside the mdat box',
+      detail:
+        'This is the step that makes the file non-compliant: the bytes sit past the declared ' +
+        'end of mdat, outside any box. A strict parser reads 00 00 00 04 as a box size of 4 ' +
+        'and rejects it as smaller than the mandatory 8-byte header.',
+    },
+    {
+      label: 'Copy the video stream verbatim',
+      detail:
+        'No re-encode. The media payload is referenced as a slice of your file, so the video ' +
+        'elementary stream is bit-identical \u2014 confirmed by SHA-256 in the test suite.',
+    },
+  ];
+
+  return {
+    mode: 'observed',
+    engine: 'native',
+    args: [],
+    outputName: 'output.mp4',
+    // Nothing is re-encoded, so the media is lossless even though the container is not valid.
+    lossless: true,
+    steps,
+    master: null,
+    fallbackReason: support.supported ? null : support.reason,
+  };
+}
+
 export function buildPlan(report: MediaReport, mode: PipelineMode): PipelinePlan {
   switch (mode) {
     case 'remux':
@@ -302,6 +358,8 @@ export function buildPlan(report: MediaReport, mode: PipelineMode): PipelinePlan
       return buildRemux(report, true);
     case 'master':
       return buildMaster(report);
+    case 'observed':
+      return buildObserved(report);
   }
 }
 
@@ -315,6 +373,11 @@ export function buildPlan(report: MediaReport, mode: PipelineMode): PipelinePlan
  */
 export function estimateSeconds(report: MediaReport, mode: PipelineMode): number {
   const duration = report.durationSec || 1;
+
+  if (mode === 'observed') {
+    // Same class of work as a native remux, plus building the artificial tail.
+    return Math.max(0.3, (report.fileSize / 1_000_000) * 0.008);
+  }
 
   if (mode !== 'master') {
     const plan = buildPlan(report, mode);
@@ -369,6 +432,14 @@ export function describeMode(
           'Normalise frame timing, resolution and chroma at a high bitrate. The only ' +
           'mode that can fix timing, the only one that costs quality, and the only one ' +
           'that needs the 31 MB engine.',
+      };
+    case 'observed':
+      return {
+        title: 'Observed transform',
+        summary:
+          'Replicates a third-party container trick: clones the AAC track and appends nine ' +
+          'artificial samples per real one, outside the mdat box. Your video is untouched, ' +
+          'but the file is deliberately not valid MP4.',
       };
   }
 }

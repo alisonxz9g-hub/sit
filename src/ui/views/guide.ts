@@ -49,15 +49,17 @@ const HOW_IT_WORKS: Item[] = [
 
 const NOT_DOING: Item[] = [
   {
-    title: 'No malformed containers',
+    title: 'Malformed containers are opt-in, never automatic',
     body:
-      'A well-known family of tools works by deliberately corrupting the file: cloning ' +
-      'the audio track, inflating its sample table by ten times, and appending junk bytes ' +
-      'outside the declared media area. The goal is to confuse the receiving platform\u2019s ' +
-      'analysis into skipping its heaviest compression. It sometimes works. It also ' +
-      'produces a file that is out of spec by construction, breaks the moment the other ' +
-      'side tightens its parser, and can get the upload rejected outright rather than ' +
-      'improved. Everything this app writes is a valid MP4.',
+      'There is a fourth mode, "Observed transform", that replicates a third-party trick: it ' +
+      'clones the AAC track, appends nine artificial samples per real one, and writes them ' +
+      'outside the mdat box. That last part violates ISO BMFF, so the output is labelled ' +
+      'CLASSIFICATION: OBSERVED / ISO BMFF COMPLIANT: NO / VALIDATION STATUS: NOT APPROVED, ' +
+      'and it is never suggested on its own. Your video is copied without re-encoding either ' +
+      'way. It is included because it demonstrably changes how one platform treats an upload, ' +
+      'and because that is your call to make \u2014 not because it is good engineering. It rests ' +
+      'entirely on how a specific parser reacts to an inflated sample table, so it can stop ' +
+      'working without warning. The other three modes produce valid files.',
   },
   {
     title: 'No claims about internal encoding ladders',

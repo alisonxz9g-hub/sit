@@ -16,8 +16,20 @@ export {
   u32,
   u64,
   fourcc,
+  readStts,
+  writeStts,
+  readStsz,
+  writeStsz,
+  readStsc,
+  writeStsc,
+  readMdhdDuration,
+  writeMdhdDuration,
+  readTkhdTrackId,
+  writeTkhdTrackId,
+  readMvhdNextTrackId,
+  writeMvhdNextTrackId,
 } from './write';
-export type { MutableBox, ChunkOffsetTable } from './write';
+export type { MutableBox, ChunkOffsetTable, SttsEntry, StszTable, StscEntry } from './write';
 export {
   AVC_FORMATS,
   HEVC_FORMATS,

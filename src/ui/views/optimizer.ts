@@ -11,7 +11,10 @@ import {
   describeMode,
   diagnose,
   estimateSeconds,
+  applyObservedTransform,
+  canApplyObserved,
   remuxNatively,
+  OBSERVED_DISCLOSURE,
   type Diagnosis,
   type MediaReport,
   type PipelineMode,
@@ -279,12 +282,16 @@ export function createOptimizer(): View {
 
     try {
       const started = performance.now();
-      const blob = plan.engine === 'native'
-        ? await runNative(job, plan)
-        : await runViaFfmpeg(job, plan, signal);
+      const blob = plan.mode === 'observed'
+        ? await runObserved(job)
+        : plan.engine === 'native'
+          ? await runNative(job, plan)
+          : await runViaFfmpeg(job, plan, signal);
       const elapsed = performance.now() - started;
 
-      const name = fmt.outputName(job.file.name, job.mode === 'master' ? 'master' : 'optimized');
+      const suffix =
+        job.mode === 'master' ? 'master' : job.mode === 'observed' ? 'observed' : 'optimized';
+      const name = fmt.outputName(job.file.name, suffix);
 
       // Re-analyse our own output rather than asserting it worked. If the result does
       // not parse, that is a bug worth surfacing, not hiding behind a download button.
@@ -333,6 +340,36 @@ export function createOptimizer(): View {
       log.write(`  dropped padding box(es): ${result.dropped.join(', ')}`, 'muted');
     }
     log.write('  media payload referenced, not copied — the bytes never entered memory', 'muted');
+    return result.blob;
+  }
+
+  /**
+   * The replicated third-party transform. Logs its compliance status on every run, because
+   * this is the one mode whose output is deliberately not a valid MP4.
+   */
+  async function runObserved(job: Job): Promise<Blob> {
+    progress.indeterminate(`${job.file.name} — applying observed transform`);
+    const result = await applyObservedTransform(job.file);
+    progress.determinate();
+    progress.set(1, `${job.file.name} — 100%`);
+
+    log.write(
+      `  cloned the AAC track as track_ID ${result.clonedTrackId}: ` +
+        `${result.sourceAudioSamples} real samples + ${result.artificialSamples} artificial`,
+      'muted',
+    );
+    log.write(
+      `  ${result.artificialBytes} bytes written past the end of mdat, outside any box`,
+      'muted',
+    );
+    log.write(
+      `  index ${result.moovBytes} B, offsets shifted ${result.offsetDelta}, ` +
+        `${result.editListsRemoved} edit list(s) removed`,
+      'muted',
+    );
+    log.write('  video stream copied verbatim — no re-encode', 'muted');
+    for (const line of OBSERVED_DISCLOSURE) log.write(`  ${line}`, 'warn');
+
     return result.blob;
   }
 
@@ -469,18 +506,22 @@ export function createOptimizer(): View {
     if (!job.report || !job.diagnosis) return;
 
     const recommended = job.diagnosis.recommended;
-    const modes: PipelineMode[] = ['remux', 'retag', 'master'];
+    // `observed` is listed last and never recommended: it is opt-in by design.
+    const modes: PipelineMode[] = ['remux', 'retag', 'master', 'observed'];
+    const observedSupport = canApplyObserved(job.report);
 
     const options = modes.map((mode) => {
       const described = describeMode(mode, job.report!);
       const isRecommended = mode === recommended;
       const engine = buildPlan(job.report!, mode).engine;
+      const unavailable = mode === 'observed' && !observedSupport.supported;
       const input = el('input', {
         attrs: {
           type: 'radio',
           name: `mode-${job.id}`,
           value: mode,
           checked: job.mode === mode,
+          disabled: unavailable,
         },
         on: {
           change: () => {
@@ -491,12 +532,23 @@ export function createOptimizer(): View {
         },
       });
 
-      return el('label', { class: `mode${job.mode === mode ? ' is-active' : ''}` }, [
+      const classes = [
+        'mode',
+        job.mode === mode ? 'is-active' : '',
+        mode === 'observed' ? 'mode-noncompliant' : '',
+        unavailable ? 'is-unavailable' : '',
+      ].filter(Boolean);
+
+      return el('label', { class: classes.join(' ') }, [
         input,
         el('span', { class: 'mode-body' }, [
           el('span', { class: 'mode-head' }, [
             el('span', { class: 'mode-title', text: described.title }),
             isRecommended && el('span', { class: 'badge badge-accent', text: 'suggested' }),
+            // The compliance status is not a footnote. Anyone selecting this mode should see
+            // what it produces before they run it, not after.
+            mode === 'observed' &&
+              el('span', { class: 'badge badge-noncompliant', text: 'not valid MP4' }),
             // Whether a mode needs the 31 MB engine is the difference between milliseconds
             // and minutes, so it belongs on the option rather than buried in the log.
             el('span', {
@@ -509,6 +561,15 @@ export function createOptimizer(): View {
             }),
           ]),
           el('span', { class: 'mode-summary', text: described.summary }),
+          unavailable &&
+            el('span', {
+              class: 'mode-blocked',
+              text:
+                `Not available for this file: ${observedSupport.reason}.` +
+                (observedSupport.needsAacPreparation
+                  ? ' Re-encode to AAC first, then apply it.'
+                  : ''),
+            }),
         ]),
       ]);
     });
@@ -559,6 +620,23 @@ export function createOptimizer(): View {
       }
 
       children.push(el('details', { class: 'plan' }, planDetails));
+    }
+
+    if (job.mode === 'observed' && observedSupport.supported) {
+      children.push(
+        el('div', { class: 'plan-danger' }, [
+          el('strong', { text: 'This mode writes a file that is not valid MP4.' }),
+          el('ul', { class: 'disclosure' }, OBSERVED_DISCLOSURE.map((line) => el('li', { text: line }))),
+          el('span', {
+            text:
+              'Your video and audio are copied without re-encoding, so no quality is lost. But ' +
+              'the artificial bytes sit outside any box, which strict parsers reject, and the ' +
+              'whole effect depends on how one specific platform reacts to an inflated audio ' +
+              'sample table. It can stop working at any time. The lossless modes above produce ' +
+              'valid files.',
+          }),
+        ]),
+      );
     }
 
     if (job.diagnosis.needsReexport.length > 0) {
