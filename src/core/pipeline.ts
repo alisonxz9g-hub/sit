@@ -74,12 +74,15 @@ function mapArgs(report: MediaReport): string[] {
 }
 
 function buildRemux(report: MediaReport, retag: boolean): PipelinePlan {
+  // Deliberately minimal. An earlier version added `-avoid_negative_ts make_zero`
+  // believing it would drop the edit list; measured against ffmpeg 9 it replaces one
+  // benign delay-compensation entry with two, including an empty edit that inserts
+  // blank presentation time. Plain stream copy preserves the source timeline exactly,
+  // which is what a lossless remux should mean.
   const args = [
     '-i', '{input}',
     ...mapArgs(report),
     '-c', 'copy',
-    // Drops any edit list rather than carrying a timeline shift into the new file.
-    '-avoid_negative_ts', 'make_zero',
     ...(retag ? BT709_COPY_FLAGS : []),
     '-movflags', '+faststart',
   ];

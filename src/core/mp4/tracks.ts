@@ -42,6 +42,8 @@ const NO_EDIT_LIST: EditListInfo = {
   entryCount: 0,
   nonTrivial: false,
   firstMediaTime: null,
+  hasEmptyEdit: false,
+  hasRateChange: false,
 };
 
 /**
@@ -256,37 +258,58 @@ function parseTkhd(payload: Uint8Array): Tkhd {
   return { trackId, width, height, rotationDegrees };
 }
 
+/**
+ * Reads `elst`.
+ *
+ * The classification here is deliberately narrow. Nearly every H.264 file carries a
+ * single edit whose media time is a few frame durations, because that is how the
+ * container expresses the encoder's B-frame reordering delay. Calling that "non-trivial"
+ * would flag essentially every file, so `nonTrivial` is reserved for lists that do
+ * something a viewer would notice: multiple segments, blank inserted time, or a speed
+ * change.
+ */
 function parseElst(payload: Uint8Array): EditListInfo {
   const r = new Reader(payload);
   const { version } = r.fullBoxHeader();
   const entryCount = r.u32();
-  if (entryCount === 0) return { present: true, entryCount: 0, nonTrivial: false, firstMediaTime: null };
+  if (entryCount === 0) {
+    return { ...NO_EDIT_LIST, present: true };
+  }
 
   const entrySize = version === 1 ? 20 : 12;
   const readable = Math.min(entryCount, Math.floor(r.remaining / entrySize));
 
   let firstMediaTime: number | null = null;
-  let nonTrivial = entryCount > 1;
+  let hasEmptyEdit = false;
+  let hasRateChange = false;
 
   for (let i = 0; i < readable; i++) {
+    let mediaTime: number;
     if (version === 1) {
       r.u64(); // segment duration
-      const mediaTime = r.i64();
-      if (i === 0) firstMediaTime = mediaTime;
-      if (mediaTime !== 0 && mediaTime !== -1) nonTrivial = true;
-      if (mediaTime === -1) nonTrivial = true; // empty edit: inserts blank time
+      mediaTime = r.i64();
     } else {
-      r.u32();
-      const mediaTime = r.i32();
-      if (i === 0) firstMediaTime = mediaTime;
-      if (mediaTime !== 0) nonTrivial = true;
+      r.u32(); // segment duration
+      mediaTime = r.i32();
     }
-    const rate = r.i16();
-    r.i16();
-    if (rate !== 1) nonTrivial = true;
+    if (i === 0) firstMediaTime = mediaTime;
+    // -1 is the "empty edit" sentinel: it inserts blank presentation time rather than
+    // mapping to any media.
+    if (mediaTime === -1) hasEmptyEdit = true;
+
+    const rateInteger = r.i16();
+    r.i16(); // rate fraction
+    if (rateInteger !== 1) hasRateChange = true;
   }
 
-  return { present: true, entryCount, nonTrivial, firstMediaTime };
+  return {
+    present: true,
+    entryCount,
+    nonTrivial: entryCount > 1 || hasEmptyEdit || hasRateChange,
+    firstMediaTime,
+    hasEmptyEdit,
+    hasRateChange,
+  };
 }
 
 /* ------------------------------------------------------------- sample entry --- */

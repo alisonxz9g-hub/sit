@@ -171,18 +171,23 @@ function timingFindings(video: Track): Finding[] {
     });
   }
 
-  if (video.editList.present && video.editList.nonTrivial) {
+  if (video.editList.nonTrivial) {
+    const parts: string[] = [`${video.editList.entryCount} segment(s)`];
+    if (video.editList.hasEmptyEdit) parts.push('blank time inserted');
+    if (video.editList.hasRateChange) parts.push('non-unity playback rate');
+
     found.push({
       id: 'edit-list',
       severity: 'note',
-      title: 'Non-trivial edit list',
+      title: 'Edit list rearranges the timeline',
       detail:
-        'The track carries an edit list that shifts or trims the media timeline. ' +
-        'Players honour it, but re-encoders vary, and a mishandled edit list shows up ' +
-        'as audio drifting out of sync. A re-encode bakes the intended timeline in.',
-      evidence:
-        `${video.editList.entryCount} edit(s), first media time ${video.editList.firstMediaTime}`,
-      fix: 'master',
+        'The track maps its media onto the timeline in more than one piece, or inserts ' +
+        'blank time. Players honour this, but re-encoders vary, and a mishandled edit ' +
+        'list shows up as audio drifting out of sync. Reported rather than fixed: ' +
+        'measured against ffmpeg, neither a stream copy nor a full re-encode reliably ' +
+        'removes an edit list, so offering to fix it would be a false promise.',
+      evidence: parts.join(', '),
+      fix: 'none',
     });
   }
 
@@ -421,8 +426,13 @@ export function diagnose(report: MediaReport): Diagnosis {
   const order: Record<Severity, number> = { blocker: 0, warning: 1, note: 2 };
   findings.sort((a, b) => order[a.severity] - order[b.severity]);
 
-  const fixable = findings.filter((f) => f.fix !== 'reexport' && f.fix !== 'none');
-  const recommended = fixable.reduce<Exclude<FixMode, 'reexport'>>((worst, f) => {
+  // Only blockers and warnings decide the mode. A note must never escalate the work:
+  // an earlier version let one recommend a multi-minute re-encode of a file that was
+  // already in good shape, which is worse than saying nothing.
+  const actionable = findings.filter(
+    (f) => f.severity !== 'note' && f.fix !== 'reexport' && f.fix !== 'none',
+  );
+  const recommended = actionable.reduce<Exclude<FixMode, 'reexport'>>((worst, f) => {
     const mode = f.fix as Exclude<FixMode, 'reexport'>;
     return MODE_COST[mode] > MODE_COST[worst] ? mode : worst;
   }, 'none');
@@ -430,7 +440,7 @@ export function diagnose(report: MediaReport): Diagnosis {
   return {
     findings,
     recommended,
-    clean: findings.every((f) => f.severity === 'note') && recommended === 'none',
+    clean: findings.every((f) => f.severity === 'note'),
     needsReexport: findings.filter((f) => f.fix === 'reexport'),
   };
 }

@@ -55,6 +55,51 @@ export class FfmpegError extends Error {
 }
 
 /**
+ * Turns a load failure into something actionable.
+ *
+ * The failure modes here are distinguishable and lead to completely different fixes, so
+ * they are worth separating rather than collapsing into one vague message.
+ */
+function describeLoadFailure(cause: unknown): string {
+  const text = cause instanceof Error ? cause.message : String(cause);
+
+  // Thrown by @ffmpeg/ffmpeg's worker when `(await import(coreURL)).default` is
+  // undefined. It runs the worker as a module, so the core has to be the ESM build;
+  // the UMD build has no ES exports and fails exactly here.
+  if (/import/i.test(text) && /fail/i.test(text)) {
+    return (
+      'The engine was downloaded but could not be initialised, which usually means the ' +
+      'wrong build of the core is being served. It must be the ESM build. Re-run ' +
+      '`npm run vendor` and reload.'
+    );
+  }
+
+  if (/fetch|network|load failed|failed to fetch/i.test(text)) {
+    return (
+      'The engine could not be downloaded. Check your connection, and check whether a ' +
+      'content blocker is stopping a 31 MB request.'
+    );
+  }
+
+  if (/WebAssembly|wasm|magic|CompileError/i.test(text)) {
+    return (
+      'The engine downloaded but the WebAssembly module was rejected, which usually ' +
+      'means the .wasm file is being served with the wrong content type or was ' +
+      'truncated in transit.'
+    );
+  }
+
+  if (/SharedArrayBuffer|crossOriginIsolated/i.test(text)) {
+    return (
+      'The engine needs SharedArrayBuffer, which means the multithreaded core is being ' +
+      'served. This app expects the single-threaded one.'
+    );
+  }
+
+  return `The engine reported: ${text}`;
+}
+
+/**
  * Loads the core, or returns the already-loaded one. Concurrent callers share a
  * single load.
  */
@@ -74,17 +119,21 @@ export async function loadFfmpeg(onLog?: LogHandler): Promise<FFmpeg> {
 
     currentLog = onLog ?? null;
 
+    const coreURL = vendorUrl('ffmpeg-core.js');
+    const wasmURL = vendorUrl('ffmpeg-core.wasm');
+
     try {
-      await ffmpeg.load({
-        coreURL: vendorUrl('ffmpeg-core.js'),
-        wasmURL: vendorUrl('ffmpeg-core.wasm'),
-      });
+      await ffmpeg.load({ coreURL, wasmURL });
     } catch (cause) {
-      throw new FfmpegError(
-        'The transcoding engine could not load. Check your connection, and check ' +
-          'whether a content blocker is stopping a 31 MB WebAssembly download.',
-        cause instanceof Error ? [cause.message] : [],
-      );
+      // Report what actually went wrong. Guessing at a cause here (and an earlier
+      // version of this guessed "check your connection") sends people chasing their
+      // network when the real fault was the wrong core flavour being served.
+      const reason = describeLoadFailure(cause);
+      throw new FfmpegError(`The transcoding engine could not load. ${reason}`, [
+        `core: ${coreURL}`,
+        `wasm: ${wasmURL}`,
+        `underlying error: ${cause instanceof Error ? cause.message : String(cause)}`,
+      ]);
     }
 
     instance = ffmpeg;

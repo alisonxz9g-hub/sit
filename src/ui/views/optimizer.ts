@@ -223,6 +223,11 @@ export function createOptimizer(): View {
         log.write('Engine ready.', 'good');
       } catch (error) {
         log.write(error instanceof Error ? error.message : String(error), 'bad');
+        // The diagnostic detail is the whole point of collecting it; hiding it here is
+        // what made an earlier failure impossible to diagnose from the UI.
+        if (error instanceof FfmpegError) {
+          for (const line of error.log) log.write(`  ${line}`, 'muted');
+        }
         progress.reset();
         queueRunning = false;
         abort = null;

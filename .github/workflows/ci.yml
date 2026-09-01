@@ -45,3 +45,35 @@ jobs:
 
       - name: Verify the build boots
         run: npm run smoke
+
+  # Separate job: it needs a browser download, and the point is to exercise the one path
+  # nothing else can reach. ffmpeg.wasm has broken twice in ways every other check passed.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Generate fixtures
+        run: npm run fixtures
+
+      - name: Build
+        run: npm run build
+
+      - name: Drive the real UI in a browser
+        run: npm run browser-check

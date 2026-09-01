@@ -16,6 +16,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "fixtures": "node scripts/make-fixtures.mjs",
     "smoke": "node scripts/smoke-dist.mjs",
+    "browser-check": "node scripts/browser-check.mjs",
+    "explain": "node scripts/explain.mjs",
     "pretest": "node scripts/build-test-bundle.mjs",
     "test": "node --test test/*.test.mjs"
   },
@@ -27,6 +29,7 @@
   "devDependencies": {
     "@types/node": "26.4.0",
     "jsdom": "30.0.1",
+    "playwright": "1.62.1",
     "typescript": "7.0.2",
     "vite": "8.2.2"
   }

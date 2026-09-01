@@ -10,7 +10,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { before, describe, it } from 'node:test';
 
-import { analyzeFile } from './.build/core.mjs';
+import { analyzeFile, diagnose } from './.build/core.mjs';
 
 const fixtureDir = path.join(import.meta.dirname, 'fixtures');
 
@@ -270,6 +270,75 @@ describe('structural properties', () => {
     const report = await analyzeFile(await loadFixture('portrait-cfr-faststart.mp4'));
     assert.equal(report.fragmented, false);
     assert.equal(report.hasLargeBoxes, false);
+  });
+});
+
+describe('edit lists', () => {
+  it('treats ordinary encoder-delay compensation as trivial', async () => {
+    // Practically every H.264 stream with B-frames carries a single edit whose media
+    // time is a few frame durations, because that is how the container expresses
+    // reordering delay. Classifying that as unusual would flag almost every file.
+    const report = await analyzeFile(await loadFixture('portrait-cfr-faststart.mp4'));
+    const { editList } = report.video;
+
+    assert.equal(editList.present, true, 'the fixture should carry an edit list');
+    assert.equal(editList.entryCount, 1);
+    assert.ok(editList.firstMediaTime > 0, 'it should offset the start');
+    assert.equal(editList.hasEmptyEdit, false);
+    assert.equal(editList.hasRateChange, false);
+    assert.equal(editList.nonTrivial, false, 'a single start offset is not noteworthy');
+  });
+});
+
+describe('recommendations are proportionate', () => {
+  it('recommends nothing for a file that is already in good shape', async () => {
+    const report = await analyzeFile(await loadFixture('portrait-cfr-faststart.mp4'));
+    const diagnosis = diagnose(report);
+
+    assert.equal(
+      diagnosis.recommended,
+      'none',
+      `a clean file should need no processing, got "${diagnosis.recommended}" because of: ` +
+        diagnosis.findings.map((f) => `${f.id}(${f.severity}->${f.fix})`).join(', '),
+    );
+    assert.equal(diagnosis.clean, true);
+  });
+
+  it('recommends only a remux when the sole problem is the index position', async () => {
+    const report = await analyzeFile(await loadFixture('portrait-no-faststart.mp4'));
+    const diagnosis = diagnose(report);
+
+    // The expensive path must not be chosen for a container-only problem.
+    assert.equal(
+      diagnosis.recommended,
+      'remux',
+      `expected a remux, got "${diagnosis.recommended}" because of: ` +
+        diagnosis.findings.map((f) => `${f.id}(${f.severity}->${f.fix})`).join(', '),
+    );
+  });
+
+  it('never lets a note escalate the recommendation', async () => {
+    for (const name of ALL_FIXTURES) {
+      if (!groundTruth.fixtures[name]) continue;
+      const diagnosis = diagnose(await analyzeFile(await loadFixture(name)));
+      if (diagnosis.recommended === 'none') continue;
+
+      // Whatever mode was chosen, some blocker or warning must justify it.
+      const justifying = diagnosis.findings.filter(
+        (f) => f.severity !== 'note' && f.fix === diagnosis.recommended,
+      );
+      assert.ok(
+        justifying.length > 0,
+        `${name}: recommended "${diagnosis.recommended}" with no blocker or warning asking for it. ` +
+          `Findings: ${diagnosis.findings.map((f) => `${f.id}(${f.severity}->${f.fix})`).join(', ')}`,
+      );
+    }
+  });
+
+  it('recommends a re-encode only where one is genuinely needed', async () => {
+    // Variable frame rate cannot be fixed by a stream copy, so this is the real case.
+    const diagnosis = diagnose(await analyzeFile(await loadFixture('vfr.mp4')));
+    assert.equal(diagnosis.recommended, 'master');
   });
 });
 

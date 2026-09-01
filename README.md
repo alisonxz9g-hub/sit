@@ -102,10 +102,14 @@ third party learns what anyone transcodes.
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run fixtures` | Regenerate test fixtures (needs `ffmpeg` and `ffprobe` on PATH) |
 | `npm test` | Bundle the sources, then run the full suite |
+| `npm run smoke` | Boot the built bundle in jsdom and check it renders |
+| `npm run browser-check` | Drive the built site in Chromium, end to end |
+| `npm run explain <fixture>` | Print the diagnosis for one fixture |
 
 ## Testing
 
-66 tests across three files. The approach matters more than the count.
+71 tests across three files, plus two out-of-band checks. The approach matters more than
+the count.
 
 **The parser is cross-validated against ffprobe.** `npm run fixtures` uses a local ffmpeg
 to generate 14 fixtures that each exercise one awkward property — moov at the end,
@@ -126,16 +130,31 @@ source comes out upright without being upscaled.
 (`<img src=x onerror=...>`) driven through the real intake path to confirm untrusted text
 reaches the page as text and never as markup.
 
+**The built site is driven in a real browser.** `npm run browser-check` serves the
+production build, launches Chromium, drops in a fixture, clicks Optimize, waits for the
+31 MB engine to load and the job to finish, then fetches the resulting blob and checks it
+begins `[ftyp][moov`. It also fails on any console error or failed request.
+
+This last one exists because it is the only check that can reach the ffmpeg.wasm path, and
+that path has broken twice in ways every other check passed:
+
+- The built site was not being deployed at all, so Pages served the TypeScript entry point.
+- The UMD core was vendored where the ESM one is required. `@ffmpeg/ffmpeg` always runs its
+  worker as a module, so `importScripts` is unavailable and it falls back to
+  `import(coreURL)`. The UMD bundle has no ES exports, so initialisation failed — after
+  downloading 31 MB. `scripts/sync-ffmpeg.mjs` now asserts the vendored core has a default
+  export, so that mistake cannot come back silently.
+
 ### Verified, and not
 
-Verified locally: typecheck clean, production build clean, all 66 tests passing, and every
-asset served with the correct MIME type from the production build — including the wasm as
-`application/wasm`, which `WebAssembly.instantiateStreaming` requires.
+Verified locally: typecheck clean, production build clean, all 71 tests passing, the
+production bundle boots under both `/` and a subpath, every asset served with the correct
+MIME type (including the wasm as `application/wasm`, which
+`WebAssembly.instantiateStreaming` requires), and a full run through the real UI in
+Chromium producing a valid MP4.
 
-Not verified: the ffmpeg.wasm code path has not been exercised in a real browser. The
-argument lists it receives are tested against native ffmpeg, and the loader is ordinary
-library usage, but the browser wiring itself is untested. Run `npm run dev` and process one
-file to confirm it before trusting it.
+Not verified: only Chromium is exercised. Safari in particular has its own history with
+WebAssembly memory limits on large files, and nothing here has been run against it.
 
 ## Deployment
 

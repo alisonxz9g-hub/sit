@@ -57,10 +57,20 @@ export interface AudioCodecInfo {
 export interface EditListInfo {
   readonly present: boolean;
   readonly entryCount: number;
-  /** True when the list does more than describe the whole media once, unshifted. */
+  /**
+   * True only when the list does something beyond offsetting the start.
+   *
+   * A single entry with a small positive media time is the standard encoder-delay
+   * compensation that every H.264 stream with B-frames carries, and treating that as a
+   * problem would flag almost every file in existence.
+   */
   readonly nonTrivial: boolean;
   /** Initial media time of the first entry, in media ticks. -1 means "empty edit". */
   readonly firstMediaTime: number | null;
+  /** An entry with media time -1, which inserts blank presentation time. */
+  readonly hasEmptyEdit: boolean;
+  /** An entry playing at a rate other than 1. */
+  readonly hasRateChange: boolean;
 }
 
 export interface Track {

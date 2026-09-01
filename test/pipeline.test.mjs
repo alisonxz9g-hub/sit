@@ -76,6 +76,21 @@ describe('remux', () => {
     assert.equal(result.video.sampleCount, before.video.sampleCount, 'frame count should be unchanged');
     assert.equal(result.video.byteLength, before.video.byteLength, 'video payload bytes should be identical');
     assert.equal(result.audio.byteLength, before.audio.byteLength, 'audio payload bytes should be identical');
+
+    // The timeline must survive untouched too. An earlier version passed
+    // `-avoid_negative_ts make_zero`, which turned one benign delay-compensation edit
+    // into two entries including an empty edit that inserts blank presentation time.
+    assert.equal(
+      result.video.editList.entryCount,
+      before.video.editList.entryCount,
+      'the edit list should not gain entries',
+    );
+    assert.equal(
+      result.video.editList.firstMediaTime,
+      before.video.editList.firstMediaTime,
+      'the start offset should be preserved',
+    );
+    assert.equal(result.video.editList.hasEmptyEdit, false, 'no empty edit should be introduced');
   });
 
   it('flattens a fragmented file into one mdat', async () => {
